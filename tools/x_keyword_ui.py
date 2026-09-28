@@ -23,19 +23,86 @@ PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 COLLECTOR = ROOT / "tools" / "x_keyword_collector.py"
 OUTPUT_ROOT = ROOT / "outputs" / "x_keyword_runs"
 MAX_KEYWORDS = 500
-ACCOUNT_NODES = {
-    "a": {"label": "账号 A（现有 GPT 会话）", "session_dir": ROOT / "tmp" / "chrome-x-keyword-profile"},
-    "b": {"label": "账号 B（独立 Claude 会话）", "session_dir": ROOT / "tmp" / "chrome-x-keyword-profile-b"},
-    "c": {"label": "账号 C（独立研究会话）", "session_dir": ROOT / "tmp" / "chrome-x-keyword-profile-c"},
-    "d": {"label": "账号 D（独立研究会话）", "session_dir": ROOT / "tmp" / "chrome-x-keyword-profile-d"},
+ACCOUNT_CONFIG_PATH = ROOT / "tmp" / "x-account-nodes.json"
+DEFAULT_ACCOUNT_LABELS = {
+    "a": "账号 A（现有 GPT 会话）",
+    "b": "账号 B（独立 Claude 会话）",
+    "c": "账号 C（独立研究会话）",
+    "d": "账号 D（独立研究会话）",
 }
 
 
-def normalize_node(value: object) -> str:
+def session_directory(node_id: str) -> Path:
+    suffix = "" if node_id == "a" else f"-{node_id}"
+    return ROOT / "tmp" / f"chrome-x-keyword-profile{suffix}"
+
+
+def load_account_nodes() -> dict[str, dict[str, Any]]:
+    stored: object = {}
+    try:
+        stored = json.loads(ACCOUNT_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        pass
+    rows = stored.get("accounts", []) if isinstance(stored, dict) else []
+    nodes: dict[str, dict[str, Any]] = {}
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            node_id = str(row.get("id", "")).strip().lower()
+            label = str(row.get("label", "")).strip()
+            if node_id and node_id.replace("_", "").isalnum() and label:
+                nodes[node_id] = {
+                    "label": label[:80],
+                    "active": bool(row.get("active", True)),
+                    "session_dir": session_directory(node_id),
+                }
+    if not nodes:
+        nodes = {
+            key: {"label": label, "active": True, "session_dir": session_directory(key)}
+            for key, label in DEFAULT_ACCOUNT_LABELS.items()
+        }
+    return nodes
+
+
+ACCOUNT_NODES = load_account_nodes()
+ACCOUNT_LOCK = threading.RLock()
+
+
+def normalize_node(value: object, require_active: bool = False) -> str:
     node = str(value or "a").strip().lower()
-    if node not in ACCOUNT_NODES:
+    if node not in ACCOUNT_NODES or (require_active and not ACCOUNT_NODES[node].get("active", True)):
         raise ValueError("采集账号节点无效")
     return node
+
+
+def node_label(node_id: str) -> str:
+    return str(ACCOUNT_NODES.get(node_id, {}).get("label") or f"账号 {node_id.upper()}")
+
+
+def save_account_nodes() -> None:
+    ACCOUNT_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"id": node_id, "label": str(node["label"]), "active": bool(node.get("active", True))}
+        for node_id, node in ACCOUNT_NODES.items()
+    ]
+    temporary = ACCOUNT_CONFIG_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"accounts": rows}, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(ACCOUNT_CONFIG_PATH)
+
+
+def next_node_id() -> str:
+    index = 0
+    while True:
+        value, number = "", index
+        while True:
+            value = chr(97 + number % 26) + value
+            number = number // 26 - 1
+            if number < 0:
+                break
+        if value not in ACCOUNT_NODES:
+            return value
+        index += 1
 
 
 def run_directory(run_id: str) -> Path:
@@ -90,7 +157,7 @@ def history_rows() -> list[dict[str, Any]]:
             "no_growth_stop": int(config.get("no_growth_stop", 5) or 5),
             "author_strategy": str(config.get("author_strategy", "per_slice")),
             "account_node": normalize_node(config.get("account_node", "a")),
-            "account_label": ACCOUNT_NODES[normalize_node(config.get("account_node", "a"))]["label"],
+            "account_label": node_label(normalize_node(config.get("account_node", "a"))),
             "pace": str(config.get("pace", "balanced")),
             "limit": int(config.get("limit", 0) or 0),
             "max_scrolls": int(config.get("max_scrolls", 12) or 12),
@@ -186,7 +253,7 @@ def run_details(run_id: str) -> dict[str, Any]:
         pass
     return {
         "run_id": run_id, "config": config, "status": status, "keywords": requested,
-        "account_node": node, "account_label": ACCOUNT_NODES[node]["label"],
+        "account_node": node, "account_label": node_label(node),
         "phase": phase, "is_running": is_running, "finalized": finalized, "posts_count": len(posts),
         "posts_preview": posts[-200:], "coverage": coverage,
         "expected_slices": expected_slices, "completed_slices": len(coverage),
@@ -200,12 +267,12 @@ def run_details(run_id: str) -> dict[str, Any]:
 
 
 PAGE = r"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>X关键词帖子采集器</title><style>
-:root{--navy:#152637;--blue:#1677ff;--line:#d8e2eb;--muted:#687b8d;--bg:#f3f6f9}*{box-sizing:border-box}body{margin:0;background:var(--bg);font-family:"Microsoft YaHei",system-ui,sans-serif;color:#172033}main{max-width:1240px;margin:auto;padding:25px}.hero{background:linear-gradient(120deg,#0f1c28,#244b68);color:white;border-radius:15px;padding:25px 29px;margin-bottom:18px}.hero h1{margin:0 0 8px;font-size:28px}.hero p{margin:0;color:#dce8f1;line-height:1.6}.grid{display:grid;grid-template-columns:1.08fr .92fr;gap:18px}@media(max-width:900px){.grid{grid-template-columns:1fr}}.panel{background:white;border:1px solid var(--line);border-radius:12px;padding:20px}.panel h2{margin:0 0 13px;font-size:19px}.step{color:var(--blue);font-size:13px;margin-right:5px}.sub{color:var(--muted);font-size:13px;line-height:1.6}textarea{width:100%;min-height:285px;resize:vertical;padding:13px;border:1px solid #aebdca;border-radius:8px;font:14px/1.55 Consolas,"Microsoft YaHei",monospace}textarea:focus,input:focus,select:focus{outline:2px solid #a8ccff;border-color:var(--blue)}.row{display:flex;gap:11px;align-items:center;flex-wrap:wrap;margin-top:11px}.row label{display:flex;align-items:center;gap:6px;font-size:14px}input[type=number],input[type=date],input[type=text],select{padding:8px 9px;border:1px solid #aebdca;border-radius:7px;background:white}.buttons{display:flex;gap:9px;flex-wrap:wrap;margin-top:15px}button,.result{border:0;border-radius:8px;padding:10px 15px;font-weight:700;cursor:pointer;text-decoration:none;display:inline-block}.primary{background:var(--blue);color:white}.secondary{background:#e6eef5;color:#17324d}.danger{background:#ffe8e8;color:#a11}.success{background:#e1f5e9;color:#116d3d}button:disabled{opacity:.48;cursor:not-allowed}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:13px 0}.stat{background:#f1f6fa;border-radius:8px;padding:11px;text-align:center}.stat b{display:block;font-size:21px;color:#174c73}.stat span{font-size:12px;color:var(--muted)}.status{display:flex;align-items:center;gap:9px;padding:11px 13px;border-radius:8px;background:#eef4f8;margin-bottom:12px}.dot{width:10px;height:10px;border-radius:50%;background:#8aa0b3}.dot.running{background:#1677ff;box-shadow:0 0 0 5px #dcecff}.dot.success{background:#1a9b53}.dot.failed{background:#d73737}.dot.stopped{background:#e18a16}pre{height:445px;overflow:auto;background:#101820;color:#d8e7f2;padding:14px;border-radius:9px;white-space:pre-wrap;word-break:break-word;font:13px/1.55 Consolas,monospace}.warn{background:#fff8df;border:1px solid #f0d993;color:#7c5700;padding:10px 12px;border-radius:8px;font-size:13px;line-height:1.55;margin-top:12px}.hidden{display:none!important}.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin:11px 0}.flow span{background:#edf4fa;border:1px solid #d4e3ef;border-radius:8px;padding:9px 6px;text-align:center;font-size:12px}.fields{display:flex;flex-wrap:wrap;gap:6px}.fields span{background:#edf4fa;border:1px solid #d4e3ef;border-radius:14px;padding:5px 8px;font:12px Consolas,monospace}.history{margin-top:18px}.history-head{display:flex;justify-content:space-between;align-items:center;gap:12px}.history-table{overflow:auto;border:1px solid var(--line);border-radius:9px;max-height:430px}.history table{border-collapse:collapse;width:100%;font-size:13px}.history th,.history td{padding:10px;border-bottom:1px solid #e4ebf0;text-align:left;vertical-align:top}.history th{background:#17324d;color:white;position:sticky;top:0}.tag{display:inline-block;padding:3px 7px;border-radius:12px;background:#e8eef3;font-size:11px}.tag.ok{background:#e1f5e9;color:#116d3d}.mini{padding:6px 9px;font-size:12px}.preset{display:grid;grid-template-columns:1fr 1fr auto auto;gap:8px;margin-top:10px}.detail-kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:14px 0}.progress-track{height:10px;background:#e5edf3;border-radius:8px;overflow:hidden}.progress-fill{height:100%;background:var(--blue)}.tabs{display:flex;gap:7px;border-bottom:1px solid var(--line);margin:15px 0}.tabs button{background:transparent;color:var(--muted);border-radius:0}.tabs button.active{color:var(--blue);border-bottom:3px solid var(--blue)}.tab-pane{display:none}.tab-pane.active{display:block}.detail-table{overflow:auto;max-height:520px;border:1px solid var(--line);border-radius:8px}.detail-table table{border-collapse:collapse;width:100%;font-size:12px}.detail-table th,.detail-table td{padding:9px;border-bottom:1px solid #e7edf2;text-align:left;vertical-align:top}.detail-table th{position:sticky;top:0;background:#17324d;color:white}.post-cell{min-width:360px;white-space:normal}.phase{padding:12px;border-radius:8px;background:#eef4f8}@media(max-width:900px){.detail-kpis{grid-template-columns:repeat(2,1fr)}}@media(max-width:700px){.preset{grid-template-columns:1fr 1fr}.history-head{align-items:flex-start;flex-direction:column}}</style></head><body><main>
+:root{--navy:#152637;--blue:#1677ff;--line:#d8e2eb;--muted:#687b8d;--bg:#f3f6f9}*{box-sizing:border-box}body{margin:0;background:var(--bg);font-family:"Microsoft YaHei",system-ui,sans-serif;color:#172033}main{max-width:1240px;margin:auto;padding:25px}.hero{background:linear-gradient(120deg,#0f1c28,#244b68);color:white;border-radius:15px;padding:25px 29px;margin-bottom:18px}.hero h1{margin:0 0 8px;font-size:28px}.hero p{margin:0;color:#dce8f1;line-height:1.6}.grid{display:grid;grid-template-columns:1.08fr .92fr;gap:18px}@media(max-width:900px){.grid{grid-template-columns:1fr}}.panel{background:white;border:1px solid var(--line);border-radius:12px;padding:20px}.panel h2{margin:0 0 13px;font-size:19px}.step{color:var(--blue);font-size:13px;margin-right:5px}.sub{color:var(--muted);font-size:13px;line-height:1.6}textarea{width:100%;min-height:285px;resize:vertical;padding:13px;border:1px solid #aebdca;border-radius:8px;font:14px/1.55 Consolas,"Microsoft YaHei",monospace}textarea:focus,input:focus,select:focus,button:focus-visible{outline:2px solid #a8ccff;outline-offset:2px;border-color:var(--blue)}.row{display:flex;gap:11px;align-items:center;flex-wrap:wrap;margin-top:11px}.row label{display:flex;align-items:center;gap:6px;font-size:14px}input[type=number],input[type=date],input[type=text],select{padding:8px 9px;border:1px solid #aebdca;border-radius:7px;background:white}.buttons{display:flex;gap:9px;flex-wrap:wrap;margin-top:15px}button,.result{border:0;border-radius:8px;padding:10px 15px;font-weight:700;cursor:pointer;text-decoration:none;display:inline-block}.primary{background:var(--blue);color:white}.secondary{background:#e6eef5;color:#17324d}.danger{background:#ffe8e8;color:#a11}.success{background:#e1f5e9;color:#116d3d}button:disabled{opacity:.48;cursor:not-allowed}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:13px 0}.stat{background:#f1f6fa;border-radius:8px;padding:11px;text-align:center}.stat b{display:block;font-size:21px;color:#174c73}.stat span{font-size:12px;color:var(--muted)}.status{display:flex;align-items:center;gap:9px;padding:11px 13px;border-radius:8px;background:#eef4f8;margin-bottom:12px}.dot{width:10px;height:10px;border-radius:50%;background:#8aa0b3}.dot.running{background:#1677ff;box-shadow:0 0 0 5px #dcecff}.dot.success{background:#1a9b53}.dot.failed{background:#d73737}.dot.stopped{background:#e18a16}pre{height:445px;overflow:auto;background:#101820;color:#d8e7f2;padding:14px;border-radius:9px;white-space:pre-wrap;word-break:break-word;font:13px/1.55 Consolas,monospace}.warn{background:#fff8df;border:1px solid #f0d993;color:#7c5700;padding:10px 12px;border-radius:8px;font-size:13px;line-height:1.55;margin-top:12px}.hidden{display:none!important}.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin:11px 0}.flow span{background:#edf4fa;border:1px solid #d4e3ef;border-radius:8px;padding:9px 6px;text-align:center;font-size:12px}.fields{display:flex;flex-wrap:wrap;gap:6px}.fields span{background:#edf4fa;border:1px solid #d4e3ef;border-radius:14px;padding:5px 8px;font:12px Consolas,monospace}.history{margin-top:18px}.history-head{display:flex;justify-content:space-between;align-items:center;gap:12px}.history-table{overflow:auto;border:1px solid var(--line);border-radius:9px;max-height:430px}.history table{border-collapse:collapse;width:100%;font-size:13px}.history th,.history td{padding:10px;border-bottom:1px solid #e4ebf0;text-align:left;vertical-align:top}.history th{background:#17324d;color:white;position:sticky;top:0}.tag{display:inline-block;padding:3px 7px;border-radius:12px;background:#e8eef3;font-size:11px}.tag.ok{background:#e1f5e9;color:#116d3d}.mini{padding:6px 9px;font-size:12px}.preset{display:grid;grid-template-columns:1fr 1fr auto auto;gap:8px;margin-top:10px}.detail-kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:14px 0}.progress-track{height:10px;background:#e5edf3;border-radius:8px;overflow:hidden}.progress-fill{height:100%;background:var(--blue)}.tabs{display:flex;gap:7px;border-bottom:1px solid var(--line);margin:15px 0}.tabs button{background:transparent;color:var(--muted);border-radius:0}.tabs button.active{color:var(--blue);border-bottom:3px solid var(--blue)}.tab-pane{display:none}.tab-pane.active{display:block}.detail-table{overflow:auto;max-height:520px;border:1px solid var(--line);border-radius:8px}.detail-table table{border-collapse:collapse;width:100%;font-size:12px}.detail-table th,.detail-table td{padding:9px;border-bottom:1px solid #e7edf2;text-align:left;vertical-align:top}.detail-table th{position:sticky;top:0;background:#17324d;color:white}.post-cell{min-width:360px;white-space:normal}.phase{padding:12px;border-radius:8px;background:#eef4f8}.node-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;margin-top:12px}.account-manager{margin-top:14px;padding:14px;border:1px solid var(--line);border-radius:10px;background:#f8fafc}.account-row{display:grid;grid-template-columns:minmax(180px,1fr) auto auto;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #e4ebf0}.account-row:last-child{border-bottom:0}@media(max-width:900px){.detail-kpis{grid-template-columns:repeat(2,1fr)}}@media(max-width:700px){.preset{grid-template-columns:1fr 1fr}.history-head{align-items:flex-start;flex-direction:column}.account-row{grid-template-columns:1fr}}</style></head><body><main>
 <section class="hero"><h1>X / Twitter 关键词帖子采集器</h1><p>关键词检索帖子，保存原文、发布时间与作者所在地；完成后自动去重、分组统计、生成可视化研究面板和一键导出包。</p></section>
-<section class="panel" data-od-id="account-control" style="margin-bottom:18px"><div class="history-head"><div><h2><span class="step">总控</span>多账号并行运行</h2><p class="sub">A、B、C、D各自使用独立登录会话。点击账号卡即可切换下方设置与实时日志。</p></div><button class="secondary" id="refreshNodes">刷新全部账号</button></div><div id="nodeCards" style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:12px"></div></section>
+<section class="panel" data-od-id="account-control" style="margin-bottom:18px"><div class="history-head"><div><h2><span class="step">总控</span>多账号并行运行</h2><p class="sub">每个账号节点使用独立登录会话。可随时添加更多节点，再分别登录不同 X 账号。</p></div><div class="buttons"><button class="primary" id="showAccountManager" aria-expanded="false">＋ 添加/管理账号</button><button class="secondary" id="refreshNodes">刷新全部账号</button></div></div><div id="nodeCards" class="node-grid"></div><div id="accountManager" class="account-manager hidden"><div class="history-head"><div><strong>账号节点管理</strong><p class="sub">名称用于辨认任务；登录 Cookie 只保存在这个节点自己的本地目录。</p></div><button class="secondary mini" id="closeAccountManager">收起</button></div><div class="row"><label for="newAccountName">新账号名称</label><input id="newAccountName" type="text" maxlength="80" placeholder="例如：Claude 英文样本"><button class="primary" id="addAccount">添加账号节点</button></div><div id="accountList" aria-live="polite"></div></div></section>
 <div class="grid"><section class="panel"><h2><span class="step">01</span>输入检索词</h2><textarea id="keywords" placeholder="每行一个关键词，例如：&#10;artificial intelligence&#10;ChatGPT&#10;生成式人工智能"></textarea><div class="buttons"><button class="secondary" id="example">载入示例</button><button class="secondary" id="clear">清空</button></div><div class="preset"><input id="presetName" type="text" placeholder="关键词方案名称"><select id="presetList"><option value="">选择已保存方案</option></select><button class="secondary mini" id="savePreset">保存方案</button><button class="secondary mini" id="loadPreset">载入方案</button></div>
 <div class="stats"><div class="stat"><b id="keywordCount">0</b><span>去重关键词</span></div><div class="stat"><b id="postEstimate">0</b><span>目标帖子上限</span></div><div class="stat"><b id="estimate">—</b><span>最低预计耗时</span></div></div>
-<div class="row"><label>采集账号 <select id="accountNode"><option value="a" selected>账号 A（现有 GPT 会话）</option><option value="b">账号 B（独立 Claude 会话）</option><option value="c">账号 C（独立研究会话）</option><option value="d">账号 D（独立研究会话）</option></select></label><span class="sub">四个账号使用不同浏览器目录，可以同时运行。</span></div>
+<div class="row"><label>采集账号 <select id="accountNode" aria-label="选择采集账号"></select></label><span class="sub">各节点使用不同浏览器目录，可以同时运行；首次使用新节点时会要求登录。</span></div>
 <h2><span class="step">02</span>运行设置</h2><div class="row"><label>模式 <select id="mode"><option value="smoke">试水：每片5条</option><option value="formal">正式：每片500条</option><option value="exhaustive">尽量完整：滚到无新增</option><option value="custom">自定义</option></select></label><label>节奏 <select id="pace"><option value="safe" selected>稳妥（推荐）</option><option value="balanced">均衡</option><option value="custom">自定义节奏</option></select></label><label>排序 <select id="searchType"><option value="live">最新帖子</option><option value="top">热门帖子</option></select></label><label>每片目标 <input id="limit" type="number" min="0" max="100000" value="20" title="0 表示不设条数上限"></label><label>最多滚动 <input id="scrolls" type="number" min="1" max="10000" value="12"></label></div><div class="row"><label>检索开始日期 <input id="startDate" type="date"></label><label>检索结束日期 <input id="endDate" type="date"></label><label>日期时区 <select id="timezoneOffset"><option value="8" selected>北京时间 UTC+8</option><option value="0">UTC</option><option value="9">日本时间 UTC+9</option><option value="-5">美国东部标准时 UTC-5</option><option value="-8">美国西部标准时 UTC-8</option></select></label><label>日期切片 <select id="sliceDays"><option value="0">不切片</option><option value="1">按天</option><option value="7" selected>按7天</option><option value="30">按30天</option></select></label><label>连续无新增停止 <input id="noGrowth" type="number" min="2" max="50" value="6"> 次</label></div><div class="row"><label>作者查询策略 <select id="authorStrategy"><option value="per_slice" selected>每片完成后立即查询新增作者</option><option value="after_search">全部帖子搜索后统一查询</option></select></label><label>作者查询间隔 <input id="authorMin" type="number" min="2" max="300" value="8">—<input id="authorMax" type="number" min="2" max="300" value="15"> 秒</label></div><details id="paceAdvanced"><summary class="sub">自定义节奏参数</summary><div class="row"><label>滚动等待 <input id="scrollDelayMin" type="number" min="1" max="300" value="4">—<input id="scrollDelayMax" type="number" min="1" max="300" value="8"> 秒</label><label>搜索片间隔 <input id="sliceDelayMin" type="number" min="0" max="3600" value="15">—<input id="sliceDelayMax" type="number" min="0" max="3600" value="30"> 秒</label></div><div class="row"><label>每完成 <input id="breakEvery" type="number" min="0" max="10000" value="15"> 片长休息</label><label>长休息 <input id="breakMin" type="number" min="0" max="86400" value="180">—<input id="breakMax" type="number" min="0" max="86400" value="360"> 秒</label><label>失败重试 <input id="retryLimit" type="number" min="0" max="10" value="3"> 次</label><label>退避 <input id="backoffMin" type="number" min="10" max="86400" value="180">—<input id="backoffMax" type="number" min="10" max="86400" value="420"> 秒</label></div></details>
 <div class="flow"><span>日期自动切片</span><span>滚动到无新增</span><span>帖子与作者去重</span><span>覆盖诊断报告</span></div><div class="warn">X 不显示总命中数，因此“尽量完整”只能表示持续滚动到网页不再返回新帖子，并逐片记录停止原因，不能证明平台数据库绝对全量。首次运行请正常登录 X。</div>
 <div class="buttons"><button class="primary" id="start">开始采集</button><button class="danger" id="stop" disabled>停止并保留断点</button><button class="success" id="resume" disabled>继续上次任务</button></div>
@@ -217,8 +284,10 @@ function presets(){try{return JSON.parse(localStorage.getItem('xKeywordPresets')
 async function api(path,options={}){const node=el('accountNode')?.value||'a',headers={'Content-Type':'application/json','X-Account-Node':node,...(options.headers||{})};const r=await fetch(path,{...options,headers}),d=await r.json();if(!r.ok)throw new Error(d.error||'请求失败');return d}start.onclick=async()=>{const list=parse(),startDate=el('startDate').value,endDate=el('endDate').value;if(!list.length)return alert('请先输入关键词。');if(startDate&&endDate&&startDate>endDate)return alert('开始日期不能晚于结束日期。');try{await api('/api/start',{method:'POST',body:JSON.stringify({account_node:el('accountNode').value,keywords:list,mode:mode.value,limit:Number(limit.value),max_scrolls:Number(scrolls.value),author_delay_min:Number(el('authorMin').value),author_delay_max:Number(el('authorMax').value),author_strategy:el('authorStrategy').value,start_date:startDate,end_date:endDate,timezone_offset:Number(el('timezoneOffset').value),search_type:el('searchType').value,slice_days:Number(el('sliceDays').value),no_growth_stop:Number(el('noGrowth').value),pace:el('pace').value,scroll_delay_min:Number(el('scrollDelayMin').value),scroll_delay_max:Number(el('scrollDelayMax').value),delay_min:Number(el('sliceDelayMin').value),delay_max:Number(el('sliceDelayMax').value),break_every:Number(el('breakEvery').value),break_min:Number(el('breakMin').value),break_max:Number(el('breakMax').value),retry_limit:Number(el('retryLimit').value),backoff_min:Number(el('backoffMin').value),backoff_max:Number(el('backoffMax').value)})});refresh();loadHistory()}catch(e){alert(e.message)}};stop.onclick=async()=>{if(confirm('停止所选账号节点并保留断点吗？'))try{await api('/api/stop',{method:'POST',body:JSON.stringify({account_node:el('accountNode').value})})}catch(e){alert(e.message)}};resume.onclick=async()=>{try{await api('/api/resume',{method:'POST',body:JSON.stringify({account_node:el('accountNode').value})});refresh()}catch(e){alert(e.message)}};
 function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}let historyCache=[],currentRunId='';async function loadHistory(){try{const h=await api('/api/history');historyCache=h.runs;el('historySummary').textContent=`共 ${h.run_count} 个历史任务，跨批次累计去重帖子 ${h.cumulative_posts} 条。`;el('batchPicker').innerHTML=h.runs.map(r=>`<option value="${esc(r.run_id)}">${esc(r.run_id)} · ${esc(r.keywords.join('、')||'无关键词')} · ${r.post_count} 条 · ${r.status==='completed'?'已完成':'未完成'}</option>`).join('')||'<option value="">暂无批次</option>';el('historyBody').innerHTML=h.runs.length?h.runs.map((r,i)=>`<tr><td>${esc(r.created_at)}</td><td><span class="tag ${r.status==='completed'?'ok':''}">${r.status==='completed'?'已完成':'未完成'}</span>${r.data_quality_warning?'<br><span class="tag">数据偏差警告</span>':''}</td><td title="${esc(r.keywords.join(' | '))}">${esc(r.keywords.slice(0,4).join('、'))}${r.keywords.length>4?'…':''}</td><td>${esc(r.start_date||'不限')} — ${esc(r.end_date||'不限')}<br><span class="sub">${r.search_type==='live'?'最新':'热门'} · ${r.slice_days?`每 ${r.slice_days} 天一片`:'不切片'} · 日期时区 UTC${Number(r.timezone_offset)>=0?'+':''}${r.timezone_offset} · ${r.pace==='safe'?'稳妥':r.pace==='balanced'?'均衡':'自定义'} · ${r.author_strategy==='per_slice'?'逐片查作者':'最后查作者'}</span></td><td>${r.post_count}</td><td>${r.resolved_authors} / ${r.unique_authors} 位已查询<br><span class="sub">${r.known_locations} 位有所在地</span></td><td><div class="buttons"><button class="primary mini" onclick="viewRun('${esc(r.run_id)}')">查看详情</button><button class="secondary mini" onclick="reuseRun(${i})">复用条件</button>${r.result_url?`<a class="result secondary mini" target="_blank" href="${r.result_url}">完整结果 ↗</a>`:''}${r.can_resume?`<button class="success mini" onclick="resumeRun('${esc(r.run_id)}')">续跑</button>`:''}</div></td></tr>`).join(''):'<tr><td colspan="7">还没有历史任务。</td></tr>'}catch(e){el('historySummary').textContent='历史记录读取失败：'+e.message}}window.reuseRun=i=>{const r=historyCache[i];keywords.value=r.keywords.join('\n');el('startDate').value=r.start_date||'';el('endDate').value=r.end_date||'';el('timezoneOffset').value=String(r.timezone_offset??8);el('searchType').value=r.search_type||'live';el('sliceDays').value=String(r.slice_days||0);el('noGrowth').value=r.no_growth_stop||5;el('authorStrategy').value=r.author_strategy||'per_slice';el('pace').value=r.pace||'balanced';mode.value='custom';limit.value=r.limit??20;scrolls.value=r.max_scrolls||12;applyMode();applyPace();update();window.scrollTo({top:0,behavior:'smooth'})};window.resumeRun=async runId=>{try{await api('/api/resume',{method:'POST',body:JSON.stringify({run_id:runId})});refresh();viewRun(runId)}catch(e){alert(e.message)}};el('refreshHistory').onclick=loadHistory;el('openBatch').onclick=()=>{const id=el('batchPicker').value;if(id)viewRun(id)};
 function phaseText(phase){return phase==='completed'?'任务已完成':phase==='enriching_authors'?'帖子搜索完成，正在逐个查询作者所在地':phase==='author_lookup_paused'?'帖子搜索已完成，作者所在地查询目前暂停':phase==='search_paused'?'帖子搜索尚未完成，断点已保留，可继续任务':'正在按关键词和日期搜索帖子'}function table(headers,rows){return `<div class="detail-table"><table><thead><tr>${headers.map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.length?rows.join(''):`<tr><td colspan="${headers.length}">暂无数据</td></tr>`}</tbody></table></div>`}function authorLocation(a){return a.account_based_in||((a.status==='unknown')?'X 未公开':(a.status==='failed')?'查询失败':'待查询')}window.viewRun=async runId=>{try{const d=await api('/api/run?run_id='+encodeURIComponent(runId));el('historySection').classList.add('hidden');el('runDetail').classList.remove('hidden');el('detailTitle').textContent=`任务 ${d.run_id}`;el('detailMeta').textContent=`关键词：${d.keywords.join('、')||'—'}　日期：${d.config.start_date||'不限'} 至 ${d.config.end_date||'不限'}`;el('detailPhase').textContent=phaseText(d.phase);const pct=d.expected_slices?Math.min(100,Math.round(d.completed_slices*100/d.expected_slices)):0;el('detailProgress').style.width=pct+'%';el('detailKpis').innerHTML=[[d.posts_count,'帖子'],[`${d.completed_slices}/${d.expected_slices}`,'搜索片'],[d.unique_authors,'去重作者'],[d.resolved_authors,'已查作者'],[d.known_locations,'已知所在地']].map(([v,l])=>`<div class="stat"><b>${v}</b><span>${l}</span></div>`).join('');el('detailActions').innerHTML=`${d.result_url?`<a class="result primary" target="_blank" href="${d.result_url}">打开完整可视化 ↗</a>`:''}${d.zip_url?`<a class="result secondary" href="${d.zip_url}">下载 ZIP</a>`:''}${d.can_resume?`<button class="success" onclick="resumeRun('${esc(d.run_id)}')">继续任务</button>`:''}`;el('postsPane').innerHTML=table(['关键词','正文','时间','作者','所在地'],d.posts_preview.map(p=>`<tr><td>${esc(p.keyword)}</td><td class="post-cell">${esc(p.post_text)}</td><td>${esc(p.posted_at)}</td><td>@${esc(p.author_username)}</td><td>${esc(p.account_based_in||'待查询')}</td></tr>`));el('authorsPane').innerHTML=table(['作者','用户ID','Account based in','状态'],d.authors.map(a=>`<tr><td>@${esc(a.username)}</td><td>${esc(a.user_id)}</td><td>${esc(authorLocation(a))}</td><td>${esc(a.status)}</td></tr>`));el('coveragePane').innerHTML=table(['关键词','日期片','帖子','滚动','停止原因','覆盖状态'],d.coverage.map(c=>`<tr><td>${esc(c.keyword)}</td><td>${esc(c.slice_start)} — ${esc(c.slice_end)}</td><td>${c.count}</td><td>${c.scrolls_used??''}</td><td>${esc(c.stop_reason)}</td><td>${esc(c.coverage_status)}</td></tr>`));el('detailLog').textContent=d.log_tail||'暂无日志';window.scrollTo({top:el('runDetail').offsetTop-20,behavior:'smooth'})}catch(e){alert('任务详情读取失败：'+e.message)}};el('backHistory').onclick=()=>{el('runDetail').classList.add('hidden');el('historySection').classList.remove('hidden');loadHistory();window.scrollTo({top:el('historySection').offsetTop-20,behavior:'smooth'})};for(const button of document.querySelectorAll('.tabs button'))button.onclick=()=>{for(const item of document.querySelectorAll('.tabs button'))item.classList.toggle('active',item===button);for(const pane of document.querySelectorAll('.tab-pane'))pane.classList.toggle('active',pane.id===button.dataset.tab)};
-function renderNodes(nodes){el('nodeCards').innerHTML=Object.entries(nodes||{}).map(([key,n])=>{const active=el('accountNode').value===key,last=(n.logs||[]).slice(-1)[0]||'暂无运行日志',color=n.status==='running'?'#1677ff':n.status==='failed'?'#d73737':n.status==='success'?'#1a9b53':'#8aa0b3';return `<button type="button" onclick="selectNode('${key}')" style="text-align:left;background:${active?'#eef6ff':'#fff'};color:#172033;border:2px solid ${active?'#1677ff':'#d8e2eb'};padding:14px;border-radius:10px"><span style="display:flex;justify-content:space-between;gap:8px"><strong>账号 ${key.toUpperCase()}</strong><span style="color:${color}">● ${esc(n.label)}</span></span><small style="display:block;color:#687b8d;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(last)}</small></button>`}).join('')}window.selectNode=key=>{el('accountNode').value=key;currentRunId='';refresh()};
-async function refresh(){try{const s=await api('/api/status');renderNodes(s.nodes);el('status').textContent=s.node_label+' · '+s.label;el('dot').className='dot '+s.status;start.disabled=s.status==='running';stop.disabled=s.status!=='running';resume.disabled=s.status==='running'||!s.can_resume;log.textContent=s.logs.length?s.logs.join('\n'):'等待任务……';log.scrollTop=log.scrollHeight;el('output').textContent=s.output_dir?'输出目录：'+s.output_dir:'尚未开始。';currentRunId=s.output_dir?s.output_dir.replaceAll('\\','/').split('/').filter(Boolean).pop():'';if(currentRunId)el('currentDetail').classList.remove('hidden');else el('currentDetail').classList.add('hidden');if(s.result_url){result.href=s.result_url;result.classList.remove('hidden')}else result.classList.add('hidden')}catch(e){el('status').textContent='页面服务连接失败'}}el('currentDetail').onclick=()=>currentRunId&&viewRun(currentRunId);const reuseRunBase=window.reuseRun;window.reuseRun=i=>{el('accountNode').value=historyCache[i].account_node||'a';reuseRunBase(i);refresh()};el('accountNode').onchange=()=>{currentRunId='';refresh()};el('refreshNodes').onclick=refresh;applyMode();applyPace();loadHistory();setInterval(refresh,1000);setInterval(loadHistory,15000);refresh();</script></body></html>"""
+function renderNodes(nodes){const rows=Object.entries(nodes||{});el('nodeCards').innerHTML=rows.map(([key,n])=>{const active=el('accountNode').value===key,last=(n.logs||[]).slice(-1)[0]||'暂无运行日志',color=n.status==='running'?'#1677ff':n.status==='failed'?'#d73737':n.status==='success'?'#1a9b53':'#8aa0b3';return `<button type="button" aria-pressed="${active}" onclick="selectNode('${esc(key)}')" style="text-align:left;background:${active?'#eef6ff':'#fff'};color:#172033;border:2px solid ${active?'#1677ff':'#d8e2eb'};padding:14px;border-radius:10px"><span style="display:flex;justify-content:space-between;gap:8px"><strong>${esc(n.node_label)}</strong><span style="color:${color}">● ${esc(n.label)}</span></span><small style="display:block;color:#687b8d;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">节点 ${esc(key.toUpperCase())} · ${esc(last)}</small></button>`}).join('')||'<p class="sub">暂无启用账号，请点击“添加/管理账号”。</p>'}window.selectNode=key=>{el('accountNode').value=key;currentRunId='';refresh()};
+let accountsCache=[];function renderAccounts(accounts){accountsCache=accounts||[];const select=el('accountNode'),current=select.value,active=accountsCache.filter(a=>a.active);select.innerHTML=active.map(a=>`<option value="${esc(a.id)}">${esc(a.label)}（节点 ${esc(a.id.toUpperCase())}）</option>`).join('');if(active.some(a=>a.id===current))select.value=current;else if(active.length)select.value=active[0].id;select.disabled=!active.length;start.disabled=!active.length;el('accountList').innerHTML=accountsCache.map(a=>`<div class="account-row"><div><strong>${esc(a.label)}</strong><div class="sub">节点 ${esc(a.id.toUpperCase())} · ${a.active?'已启用':'已停用'} · ${a.status==='running'?'正在运行':'当前'+esc(a.state_label||'空闲')}</div></div><button class="secondary mini" onclick="renameAccount('${esc(a.id)}')">重命名</button><button class="${a.active?'danger':'success'} mini" ${a.status==='running'?'disabled title="运行中不能停用"':''} onclick="toggleAccount('${esc(a.id)}',${!a.active})">${a.active?'停用':'重新启用'}</button></div>`).join('')||'<p class="sub">暂无账号节点。</p>'}
+async function loadAccounts(){try{const data=await api('/api/accounts');renderAccounts(data.accounts)}catch(e){alert('账号列表读取失败：'+e.message)}}window.renameAccount=async id=>{const item=accountsCache.find(a=>a.id===id),label=prompt('输入新的账号名称：',item?.label||'');if(label===null)return;try{const data=await api('/api/accounts/update',{method:'POST',body:JSON.stringify({id,label})});renderAccounts(data.accounts);refresh()}catch(e){alert(e.message)}};window.toggleAccount=async(id,active)=>{if(!active&&!confirm('停用后不会删除登录目录和历史任务，确定继续吗？'))return;try{const data=await api('/api/accounts/update',{method:'POST',body:JSON.stringify({id,active})});renderAccounts(data.accounts);refresh()}catch(e){alert(e.message)}};el('addAccount').onclick=async()=>{const label=el('newAccountName').value.trim();if(!label)return alert('请填写账号名称。');try{const data=await api('/api/accounts/create',{method:'POST',body:JSON.stringify({label})});renderAccounts(data.accounts);el('accountNode').value=data.created_id;el('newAccountName').value='';refresh()}catch(e){alert(e.message)}};el('showAccountManager').onclick=()=>{el('accountManager').classList.remove('hidden');el('showAccountManager').setAttribute('aria-expanded','true');el('newAccountName').focus()};el('closeAccountManager').onclick=()=>{el('accountManager').classList.add('hidden');el('showAccountManager').setAttribute('aria-expanded','false')};
+async function refresh(){try{if(!el('accountNode').value)return;const s=await api('/api/status');renderNodes(s.nodes);el('status').textContent=s.node_label+' · '+s.label;el('dot').className='dot '+s.status;start.disabled=s.status==='running';stop.disabled=s.status!=='running';resume.disabled=s.status==='running'||!s.can_resume;log.textContent=s.logs.length?s.logs.join('\n'):'等待任务……';log.scrollTop=log.scrollHeight;el('output').textContent=s.output_dir?'输出目录：'+s.output_dir:'尚未开始。';currentRunId=s.output_dir?s.output_dir.replaceAll('\\','/').split('/').filter(Boolean).pop():'';if(currentRunId)el('currentDetail').classList.remove('hidden');else el('currentDetail').classList.add('hidden');if(s.result_url){result.href=s.result_url;result.classList.remove('hidden')}else result.classList.add('hidden')}catch(e){el('status').textContent='页面服务连接失败'}}el('currentDetail').onclick=()=>currentRunId&&viewRun(currentRunId);const reuseRunBase=window.reuseRun;window.reuseRun=i=>{const wanted=historyCache[i].account_node||'a';if(accountsCache.some(a=>a.id===wanted&&a.active))el('accountNode').value=wanted;reuseRunBase(i);refresh()};el('accountNode').onchange=()=>{currentRunId='';refresh()};el('refreshNodes').onclick=()=>{loadAccounts();refresh()};applyMode();applyPace();loadHistory();loadAccounts().then(refresh);setInterval(refresh,1000);setInterval(loadHistory,15000);</script></body></html>"""
 
 
 def read_json(path: Path, default: object) -> object:
@@ -314,6 +383,63 @@ class JobManager:
 MANAGERS={node_id:JobManager(node_id) for node_id in ACCOUNT_NODES}
 
 
+def accounts_payload() -> list[dict[str, Any]]:
+    rows = []
+    for node_id, node in ACCOUNT_NODES.items():
+        manager = MANAGERS.get(node_id)
+        snapshot = manager.snapshot() if manager else {"status": "idle", "label": "空闲"}
+        rows.append({
+            "id": node_id,
+            "label": str(node["label"]),
+            "active": bool(node.get("active", True)),
+            "status": snapshot["status"],
+            "state_label": snapshot["label"],
+        })
+    return rows
+
+
+def create_account_node(label: object) -> str:
+    clean_label = str(label or "").strip()
+    if not clean_label:
+        raise ValueError("账号名称不能为空")
+    if len(clean_label) > 80:
+        raise ValueError("账号名称最多 80 个字符")
+    with ACCOUNT_LOCK:
+        if len(ACCOUNT_NODES) >= 200:
+            raise ValueError("单台电脑最多配置 200 个账号节点")
+        node_id = next_node_id()
+        ACCOUNT_NODES[node_id] = {
+            "label": clean_label,
+            "active": True,
+            "session_dir": session_directory(node_id),
+        }
+        MANAGERS[node_id] = JobManager(node_id)
+        save_account_nodes()
+    return node_id
+
+
+def update_account_node(node_id: object, label: object = None, active: object = None) -> None:
+    node_id = normalize_node(node_id)
+    with ACCOUNT_LOCK:
+        node = ACCOUNT_NODES[node_id]
+        if label is not None:
+            clean_label = str(label).strip()
+            if not clean_label:
+                raise ValueError("账号名称不能为空")
+            if len(clean_label) > 80:
+                raise ValueError("账号名称最多 80 个字符")
+            node["label"] = clean_label
+        if active is not None:
+            enabled = bool(active)
+            manager = MANAGERS[node_id]
+            if not enabled and manager.status == "running":
+                raise RuntimeError("账号正在运行，不能停用")
+            if not enabled and sum(bool(item.get("active", True)) for item in ACCOUNT_NODES.values()) <= 1:
+                raise ValueError("至少保留一个启用账号")
+            node["active"] = enabled
+        save_account_nodes()
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,format:str,*args:object)->None:return
     def send_bytes(self,data:bytes,content_type:str,status:int=200)->None:self.send_response(status);self.send_header("Content-Type",content_type);self.send_header("Content-Length",str(len(data)));self.send_header("Cache-Control","no-store");self.end_headers();self.wfile.write(data)
@@ -325,8 +451,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self)->None:
         parsed=urllib.parse.urlsplit(self.path)
         if parsed.path=="/":self.send_bytes(PAGE.encode(),"text/html; charset=utf-8");return
+        if parsed.path=="/api/accounts":self.send_json({"accounts":accounts_payload()});return
         if parsed.path=="/api/status":
-            params=urllib.parse.parse_qs(parsed.query);node=normalize_node(params.get("node",[self.headers.get("X-Account-Node","a")])[0]);snapshot=MANAGERS[node].snapshot();snapshot["nodes"]={key:manager.snapshot() for key,manager in MANAGERS.items()};self.send_json(snapshot);return
+            params=urllib.parse.parse_qs(parsed.query);node=normalize_node(params.get("node",[self.headers.get("X-Account-Node","a")])[0],True);snapshot=MANAGERS[node].snapshot();snapshot["nodes"]={key:manager.snapshot() for key,manager in MANAGERS.items() if ACCOUNT_NODES[key].get("active",True)};self.send_json(snapshot);return
         if parsed.path=="/api/history":
             runs=history_rows();self.send_json({"runs":runs,"run_count":len(runs),"cumulative_posts":len(cumulative_posts())});return
         if parsed.path=="/api/run":
@@ -345,8 +472,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self)->None:
         try:
             data=self.read_json()
+            if self.path=="/api/accounts/create":
+                node_id=create_account_node(data.get("label"));self.send_json({"ok":True,"created_id":node_id,"accounts":accounts_payload()});return
+            if self.path=="/api/accounts/update":
+                update_account_node(data.get("id"),data.get("label") if "label" in data else None,data.get("active") if "active" in data else None);self.send_json({"ok":True,"accounts":accounts_payload()});return
             if self.path=="/api/start":
-                node=normalize_node(data.get("account_node","a"));manager=MANAGERS[node]
+                node=normalize_node(data.get("account_node","a"),True);manager=MANAGERS[node]
                 keywords=normalize_keywords(data.get("keywords"));mode=str(data.get("mode","smoke"))
                 if mode=="smoke":limit,max_scrolls=5,4
                 elif mode=="formal":limit,max_scrolls=500,150
@@ -374,9 +505,9 @@ class Handler(BaseHTTPRequestHandler):
                 if author_strategy not in {"per_slice","after_search"}:raise ValueError("作者查询策略无效")
                 manager.start(keywords,limit,max_scrolls,amin,amax,start_date,end_date,timezone_offset,search_type,slice_days,no_growth_stop,author_strategy,rhythm);self.send_json({"ok":True,"node":node});return
             if self.path=="/api/resume":
-                run_id=str(data.get("run_id","")).strip();node=normalize_node(data.get("account_node") or (read_json(run_directory(run_id)/"run_config.json",{}).get("account_node","a") if run_id else "a"));MANAGERS[node].resume(run_id);self.send_json({"ok":True,"node":node});return
+                run_id=str(data.get("run_id","")).strip();node=normalize_node(data.get("account_node") or (read_json(run_directory(run_id)/"run_config.json",{}).get("account_node","a") if run_id else "a"),True);MANAGERS[node].resume(run_id);self.send_json({"ok":True,"node":node});return
             if self.path=="/api/stop":
-                node=normalize_node(data.get("account_node","a"));MANAGERS[node].stop();self.send_json({"ok":True,"node":node});return
+                node=normalize_node(data.get("account_node","a"),True);MANAGERS[node].stop();self.send_json({"ok":True,"node":node});return
             self.send_json({"error":"接口不存在"},HTTPStatus.NOT_FOUND)
         except (ValueError,RuntimeError,json.JSONDecodeError) as exc:self.send_json({"error":str(exc)},HTTPStatus.BAD_REQUEST)
 
