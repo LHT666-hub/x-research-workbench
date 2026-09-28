@@ -45,3 +45,32 @@ def test_history_and_cross_run_dedup(tmp_path: Path, monkeypatch) -> None:
     assert detail["resolved_authors"] == 1
     assert detail["known_locations"] == 1
 
+
+def test_dynamic_account_management(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(ui, "OUTPUT_ROOT", tmp_path / "outputs")
+    monkeypatch.setattr(ui, "ACCOUNT_CONFIG_PATH", tmp_path / "account-nodes.json")
+    monkeypatch.setattr(ui, "ACCOUNT_NODES", {
+        "a": {"label": "主账号", "active": True, "session_dir": tmp_path / "session-a"},
+    })
+    monkeypatch.setattr(ui, "MANAGERS", {"a": ui.JobManager("a")})
+
+    created = ui.create_account_node("Claude 英文样本")
+    assert created == "b"
+    assert ui.ACCOUNT_NODES[created]["session_dir"] != ui.ACCOUNT_NODES["a"]["session_dir"]
+    assert created in ui.MANAGERS
+
+    ui.update_account_node(created, label="Claude 第二账号", active=False)
+    accounts = ui.accounts_payload()
+    assert next(row for row in accounts if row["id"] == created)["label"] == "Claude 第二账号"
+    assert not ui.ACCOUNT_NODES[created]["active"]
+
+    reloaded = ui.load_account_nodes()
+    assert reloaded[created]["label"] == "Claude 第二账号"
+    assert not reloaded[created]["active"]
+
+
+def test_account_management_controls_are_present() -> None:
+    assert 'id="showAccountManager"' in ui.PAGE
+    assert 'id="addAccount"' in ui.PAGE
+    assert 'id="accountList"' in ui.PAGE
+
