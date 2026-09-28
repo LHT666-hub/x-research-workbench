@@ -1,0 +1,28 @@
+# Local Python environment and caches
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Login sessions, cookies and temporary browser state
+tmp/
+*chrome-profile*/
+*session*/
+
+# Collected research data and runtime logs
+outputs/
+logs/
+exports/
+*.log
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+config.local.json
+
+# Editor / OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
