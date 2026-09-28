@@ -73,4 +73,47 @@ def test_account_management_controls_are_present() -> None:
     assert 'id="showAccountManager"' in ui.PAGE
     assert 'id="addAccount"' in ui.PAGE
     assert 'id="accountList"' in ui.PAGE
+    assert 'id="stopAll"' in ui.PAGE
+    assert 'id="resumeAll"' in ui.PAGE
+    assert "radial-gradient(circle at 12% 0%" in ui.PAGE
+
+
+def test_bulk_stop_and_resume(monkeypatch) -> None:
+    class FakeManager:
+        def __init__(self, status: str, can_resume: bool = False) -> None:
+            self.status = status
+            self.can_resume = can_resume
+            self.stopped = False
+            self.resumed = False
+
+        def snapshot(self) -> dict[str, object]:
+            return {"can_resume": self.can_resume}
+
+        def stop(self) -> None:
+            self.stopped = True
+            self.status = "stopped"
+            self.can_resume = True
+
+        def resume(self) -> None:
+            self.resumed = True
+            self.status = "running"
+            self.can_resume = False
+
+    running = FakeManager("running")
+    paused = FakeManager("stopped", can_resume=True)
+    inactive = FakeManager("running")
+    monkeypatch.setattr(ui, "ACCOUNT_NODES", {
+        "a": {"active": True}, "b": {"active": True}, "c": {"active": False},
+    })
+    monkeypatch.setattr(ui, "MANAGERS", {"a": running, "b": paused, "c": inactive})
+
+    stopped = ui.stop_all_jobs()
+    assert stopped["stopped"] == ["a"]
+    assert running.stopped
+    assert not inactive.stopped
+
+    resumed = ui.resume_all_jobs()
+    assert resumed["resumed"] == ["a", "b"]
+    assert running.resumed and paused.resumed
+    assert not inactive.resumed
 
