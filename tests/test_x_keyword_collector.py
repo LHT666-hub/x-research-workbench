@@ -10,6 +10,7 @@ from playwright.sync_api import sync_playwright
 
 
 PROJECT = Path(__file__).resolve().parents[1]
+WORKSPACE = PROJECT.parent
 sys.path.insert(0, str(PROJECT / "tools"))
 
 import x_keyword_collector as collector  # noqa: E402
@@ -42,16 +43,9 @@ def test_extract_visible_post() -> None:
 
 
 def test_real_about_response_path() -> None:
-    payload = {
-        "data": {
-            "user_result_by_screen_name": {
-                "result": {
-                    "rest_id": "147929555",
-                    "about_profile": {"account_based_in": "United States"},
-                }
-            }
-        }
-    }
+    evidence = WORKSPACE / "x_probe_logged_in" / "matched_response_08.json"
+    capture = json.loads(evidence.read_text(encoding="utf-8"))
+    payload = json.loads(capture["body"])
     result = about_result(payload)
     assert result is not None
     assert result["rest_id"] == "147929555"
@@ -106,6 +100,11 @@ def test_dedup_groups_and_one_click_exports(tmp_path: Path) -> None:
     assert "帖子时间分布" in report
     assert "搜索覆盖诊断" in report
     assert "滚动无新增" in report
+    assert "id='authorSearch'" in report
+    assert "id='locationStatus'" in report
+    assert "id='sortOrder'" in report
+    assert "id='pageSize'" in report
+    assert "id='filteredCount'" in report
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(executable_path=str(collector.CHROME), headless=True)
         page = browser.new_page(accept_downloads=True)
@@ -118,6 +117,11 @@ def test_dedup_groups_and_one_click_exports(tmp_path: Path) -> None:
         page.fill("#dateFrom", "2026-09-27")
         page.fill("#dateTo", "2026-09-27")
         assert page.locator("#rows tr:not([hidden])").count() == 1
+        page.fill("#authorSearch", "alice")
+        page.select_option("#locationStatus", "known")
+        page.select_option("#pageSize", "25")
+        assert page.locator("#filteredCount").inner_text() == "1"
+        assert page.locator("#filteredAuthors").inner_text() == "1"
         with page.expect_download() as pending:
             page.click("#filteredExport")
         assert pending.value.suggested_filename == "filtered_posts.csv"
