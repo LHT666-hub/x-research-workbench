@@ -76,6 +76,11 @@ def test_account_management_controls_are_present() -> None:
     assert 'id="stopAll"' in ui.PAGE
     assert 'id="resumeAll"' in ui.PAGE
     assert "radial-gradient(circle at 12% 0%" in ui.PAGE
+    assert 'class="settings-grid"' in ui.PAGE
+    assert "采集范围" in ui.PAGE
+    assert "时间与切片" in ui.PAGE
+    assert "作者所在地补全" in ui.PAGE
+    assert "高级节奏参数" in ui.PAGE
 
 
 def test_bulk_stop_and_resume(monkeypatch) -> None:
