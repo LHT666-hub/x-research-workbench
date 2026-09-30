@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,12 +27,51 @@ SHANGHAI = timezone(timedelta(hours=8))
 SEARCH_PATH = re.compile(r"/i/api/graphql/[A-Za-z0-9_-]+/SearchTimeline\Z")
 
 
+def _system_proxy() -> str | None:
+    """Use the current user's ordinary Windows HTTP proxy, if configured."""
+    if sys.platform != "win32":
+        return None
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                        r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as key:
+        try:
+            enabled = int(winreg.QueryValueEx(key, "ProxyEnable")[0])
+            value = str(winreg.QueryValueEx(key, "ProxyServer")[0]).strip()
+        except FileNotFoundError:
+            return None
+    if not enabled or not value:
+        return None
+    if ";" in value or "=" in value:
+        entries = dict(part.split("=", 1) for part in value.split(";") if "=" in part)
+        value = entries.get("https") or entries.get("http") or ""
+    if not value:
+        return None
+    proxy = value if "://" in value else "http://" + value
+    parsed = urlsplit(proxy)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or not parsed.port:
+        return None
+    return proxy
+
+
+async def _network_preflight(proxy: str | None) -> bool:
+    """Check reachability before prompting for private account credentials."""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(proxy=proxy, timeout=10, follow_redirects=True) as client:
+            response = await client.head("https://x.com/")
+        return response.status_code < 500
+    except httpx.RequestError:
+        return False
+
+
 def _twikit_client():
     try:
         from twikit import Client
     except ImportError as exc:
         raise RuntimeError("请先安装 requirements-browserless.txt（仅试验环境）") from exc
-    return Client("en-US")
+    return Client("en-US", proxy=_system_proxy())
 
 
 def _iso_timestamp(value: Any) -> str:
@@ -199,12 +239,16 @@ async def _login(args: argparse.Namespace) -> int:
     if cookies.exists():
         print("该试验会话已存在；不会重复登录或覆盖它。", file=sys.stderr)
         return 2
+    proxy = _system_proxy()
+    if not await _network_preflight(proxy):
+        print("登录前连通性检查失败：Python 尚不能访问 X。请检查系统代理或网络，再重试；尚未询问账号密码。", file=sys.stderr)
+        return 1
     cookies.parent.mkdir(parents=True, exist_ok=True)
     username = args.username or input("第六个账号的 X 用户名：").strip().lstrip("@")
     if not username:
         print("未输入用户名；不会尝试登录。", file=sys.stderr)
         return 2
-    print("注意：下面输入的邮箱和密码会显示在当前终端屏幕上；不要截图或共享屏幕。程序不会把密码写入日志或命令行。")
+    print("注意：下面输入的邮箱、密码和可能出现的 2FA 验证码会显示在当前终端屏幕上；不要截图或共享屏幕。程序不会把密码写入日志或命令行。")
     email = input("第六个账号的邮箱（可留空）：").strip() or None
     password = input("第六个账号的 X 密码（输入时可见）：")
     if not password:
@@ -222,7 +266,7 @@ async def _login(args: argparse.Namespace) -> int:
     if not cookies.exists():
         print("登录返回成功，但未生成会话文件；不会开始采集。", file=sys.stderr)
         return 1
-    print(f"试验账号登录完成。会话只在本机：{cookies}")
+    print(f"试验账号登录完成。后续 probe 复用本机会话，无需每次输入密码或 2FA：{cookies}")
     return 0
 
 

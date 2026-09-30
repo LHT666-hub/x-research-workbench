@@ -77,11 +77,13 @@ py -3 -m venv .venv-browserless
 .venv-browserless\Scripts\python.exe -m pip install -r requirements-browserless.txt
 ```
 
-准备好一个没有被其他采集任务占用的自有账号后，在你自己的电脑终端执行一次正常登录。邮箱和密码会在终端中**可见**，请勿截图或共享屏幕；程序不会将密码加入命令行或日志，也不要把凭据发给别人或提交到 GitHub：
+准备好一个没有被其他采集任务占用的自有账号后，在你自己的电脑终端执行一次正常登录。程序先用 Windows 当前用户的系统代理检查 X 连通性，检查失败就不会询问账号密码。邮箱、密码和可能出现的 2FA 验证码会在终端中**可见**，请勿截图或共享屏幕；程序不会将密码加入命令行或日志，也不要把凭据发给别人或提交到 GitHub：
 
 ```powershell
 .venv-browserless\Scripts\python.exe tools\x_browserless_probe.py login
 ```
+
+如果 X 要求验证器动态码，Twikit 会在首次登录流程中提示你手动输入；不要提供验证器密钥，也不要尝试绕过验证。登录成功后会话只保存在本机被 Git 忽略的 `tmp/browserless_probe/cookies.json`；后续 `probe` 直接读取该文件，正常情况下无需再次输入密码或 2FA。会话失效时须由你重新完成正常登录。不要把会话文件共享给他人。
 
 登录成功后，选一日最多试探三页；收到 429、401/403 或 404 就停止，不绕过验证码、权限或额度。可只读对比已有 GPT 批次的帖子 ID：
 
