@@ -4,11 +4,14 @@ import json
 import sys
 from pathlib import Path
 
+from playwright.sync_api import sync_playwright
+
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "tools"))
 
 import x_keyword_ui as ui  # noqa: E402
+import x_keyword_collector as collector  # noqa: E402
 
 
 def test_history_and_cross_run_dedup(tmp_path: Path, monkeypatch) -> None:
@@ -24,7 +27,7 @@ def test_history_and_cross_run_dedup(tmp_path: Path, monkeypatch) -> None:
         directory.mkdir()
         (directory / "run_config.json").write_text(json.dumps({"keyword_count": 1, "limit": 0, "max_scrolls": 1000, "start_date": "2025-01-01", "end_date": "2025-03-31", "search_type": "live", "slice_days": 1, "no_growth_stop": 8, "pace": "safe"}), encoding="utf-8")
         (directory / "status.json").write_text(json.dumps({"post_count": 1, "resolved_authors": 1}), encoding="utf-8")
-        (directory / "raw.json").write_text(json.dumps({"requested_keywords": [keyword], "generated_at": run_id, "finalized": True, "posts": [dict(base, keyword=keyword, author_username="a")], "authors": {"a": {"username": "a", "user_id": "1", "account_based_in": "Japan", "status": "success"}}, "search_runs": [{"keyword": keyword, "slice_start": "2025-03-01", "slice_end": "2025-03-01", "count": 1}]}), encoding="utf-8")
+        (directory / "raw.json").write_text(json.dumps({"requested_keywords": [keyword], "generated_at": run_id, "finalized": True, "posts": [dict(base, keyword=keyword, author_username="a")], "authors": {"a": {"username": "a", "user_id": "1", "profile_location": "", "profile_location_status": "pending", "account_based_in": "Japan", "status": "success"}}, "search_runs": [{"keyword": keyword, "slice_start": "2025-03-01", "slice_end": "2025-03-01", "count": 1}]}), encoding="utf-8")
         (directory / "research_dataset.json").write_text(json.dumps([dict(base, matched_keywords=keyword)]), encoding="utf-8")
         (directory / "index.html").write_text("ok", encoding="utf-8")
 
@@ -44,6 +47,8 @@ def test_history_and_cross_run_dedup(tmp_path: Path, monkeypatch) -> None:
     assert detail["posts_count"] == 1
     assert detail["resolved_authors"] == 1
     assert detail["known_locations"] == 1
+    assert detail["profile_location_backlog_count"] == 1
+    assert detail["can_profile_backfill"]
 
 
 def test_dynamic_account_management(tmp_path: Path, monkeypatch) -> None:
@@ -81,6 +86,33 @@ def test_account_management_controls_are_present() -> None:
     assert "时间与切片" in ui.PAGE
     assert "作者所在地补全" in ui.PAGE
     assert "高级节奏参数" in ui.PAGE
+    assert 'id="searchEngine"' in ui.PAGE
+    assert 'value="graphql" selected' in ui.PAGE
+    assert 'value="deferred" selected' in ui.PAGE
+    assert "/api/backfill" in ui.PAGE
+    assert "/api/profile-backfill" in ui.PAGE
+    assert "/api/repair" in ui.PAGE
+    assert "window.repairRun" in ui.PAGE
+    assert "window.profileBackfillRun" in ui.PAGE
+
+
+def test_workbench_page_javascript_loads_without_syntax_errors(tmp_path: Path) -> None:
+    page_path = tmp_path / "workbench.html"
+    page_path.write_text(ui.PAGE, encoding="utf-8")
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(executable_path=str(collector.CHROME), headless=True)
+        page = browser.new_page()
+        errors: list[str] = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.goto(page_path.as_uri())
+        assert page.evaluate("typeof phaseText") == "function"
+        assert page.evaluate("typeof window.backfillRun") == "function"
+        assert page.evaluate("typeof window.repairRun") == "function"
+        assert page.evaluate("typeof window.profileBackfillRun") == "function"
+        assert page.locator("#searchEngine").input_value() == "graphql"
+        assert page.locator("#authorStrategy").input_value() == "deferred"
+        assert errors == []
+        browser.close()
 
 
 def test_bulk_stop_and_resume(monkeypatch) -> None:
@@ -121,4 +153,101 @@ def test_bulk_stop_and_resume(monkeypatch) -> None:
     assert resumed["resumed"] == ["a", "b"]
     assert running.resumed and paused.resumed
     assert not inactive.resumed
+
+
+def test_history_exposes_abnormal_date_repair_queue(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(ui, "OUTPUT_ROOT", tmp_path)
+    run_id = "20260929_010203"
+    directory = tmp_path / run_id
+    directory.mkdir()
+    (directory / "run_config.json").write_text(json.dumps({
+        "account_node": "a", "start_date": "2026-01-01", "end_date": "2026-01-02",
+        "slice_days": 1, "search_engine": "graphql", "author_strategy": "deferred",
+    }), encoding="utf-8")
+    (directory / "raw.json").write_text(json.dumps({
+        "requested_keywords": ["GPT"], "finalized": False, "posts": [],
+        "authors": {"alice": {"username": "alice", "status": "pending"}},
+        "search_runs": [
+            {"keyword": "GPT", "slice_start": "2026-01-01", "slice_end": "2026-01-01",
+             "count": 0, "stop_reason": "no_network_response", "coverage_status": "needs_retry"},
+            {"keyword": "GPT", "slice_start": "2026-01-02", "slice_end": "2026-01-02",
+             "count": 12, "stop_reason": "cursor_exhausted", "coverage_status": "apparently_exhausted"},
+        ],
+    }), encoding="utf-8")
+
+    row = ui.history_rows()[0]
+    detail = ui.run_details(run_id)
+
+    assert row["repair_queue_count"] == 1
+    assert row["can_repair"]
+    assert detail["completed_slices"] == 1
+    assert detail["repair_queue_count"] == 1
+    assert detail["repair_queue"][0]["slice_start"] == "2026-01-01"
+
+
+def test_pagination_not_triggered_is_a_repairable_slice() -> None:
+    run = {
+        "keyword": "GPT", "slice_start": "2026-01-03", "slice_end": "2026-01-03",
+        "count": 37, "stop_reason": "pagination_not_triggered", "coverage_status": "needs_retry",
+    }
+    assert ui._search_run_needs_retry(run)
+    assert ui.repair_queue_rows({"search_runs": [run]})[0]["slice_start"] == "2026-01-03"
+
+
+def test_profile_backfill_command_is_separate_from_account_backfill(tmp_path: Path, monkeypatch) -> None:
+    session_dir = tmp_path / "session"
+    output_root = tmp_path / "outputs"
+    output_root.mkdir()
+    monkeypatch.setattr(ui, "OUTPUT_ROOT", output_root)
+    monkeypatch.setattr(ui, "ACCOUNT_NODES", {
+        "a": {"label": "账号 A", "active": True, "session_dir": session_dir},
+    })
+    manager = ui.JobManager("a")
+    directory = tmp_path / "run"
+    directory.mkdir()
+    command = manager._command(directory, {"author_strategy": "deferred"}, True, True)
+    assert "--profile-location-backfill-only" in command
+    assert command[command.index("--author-strategy") + 1] == "deferred"
+    assert command[command.index("--pagination-trigger-attempts") + 1] == "3"
+    assert command[command.index("--pagination-trigger-timeout-ms") + 1] == "15000"
+
+
+def test_profile_backfill_preserves_finalized_search_and_builds_its_own_queue(tmp_path: Path, monkeypatch) -> None:
+    output_root = tmp_path / "outputs"
+    run_id = "20260930_010203_a"
+    directory = output_root / run_id
+    directory.mkdir(parents=True)
+    monkeypatch.setattr(ui, "OUTPUT_ROOT", output_root)
+    monkeypatch.setattr(ui, "ACCOUNT_NODES", {
+        "a": {"label": "账号 A", "active": True, "session_dir": tmp_path / "session"},
+    })
+    (directory / "run_config.json").write_text(json.dumps({
+        "account_node": "a", "keyword_count": 1, "author_strategy": "deferred",
+    }), encoding="utf-8")
+    (directory / "raw.json").write_text(json.dumps({
+        "requested_keywords": ["GPT"], "finalized": True,
+        "posts": [{"author_username": "Alice", "author_user_id": "7"}],
+        "authors": {"alice": {
+            "username": "Alice", "user_id": "7", "profile_location": "",
+            "profile_location_status": "pending", "account_based_in": "United States",
+            "status": "success",
+        }},
+        "search_runs": [],
+    }), encoding="utf-8")
+    manager = ui.JobManager("a")
+    launched: dict[str, object] = {}
+
+    def fake_launch(path: Path, config: dict[str, object], resume: bool = False, profile_location_backfill_only: bool = False) -> None:
+        launched.update(path=path, config=config, resume=resume, profile_only=profile_location_backfill_only)
+
+    monkeypatch.setattr(manager, "_launch", fake_launch)
+    manager.profile_backfill(run_id)
+
+    raw = json.loads((directory / "raw.json").read_text(encoding="utf-8"))
+    queue = json.loads((directory / "profile_location_queue.json").read_text(encoding="utf-8"))
+    assert raw["finalized"] is True
+    assert raw["active_phase"] == "profile_location_enriching"
+    assert queue[0]["username"] == "Alice"
+    assert launched["resume"] is True
+    assert launched["profile_only"] is True
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import email.utils
 import html
 import json
 import random
@@ -24,13 +25,15 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SESSION_DIR = ROOT / "tmp" / "chrome-x-keyword-profile"
 OUTPUT_ROOT = ROOT / "outputs" / "x_keyword_runs"
 SHARED_ABOUT_COOLDOWN = ROOT / "tmp" / "x-about-cooldown.json"
+RETRYABLE_SEARCH_STOP_REASONS = {"no_network_response", "pagination_not_triggered"}
 
 
 class RateLimitError(RuntimeError):
-    def __init__(self, status: int = 429, retry_after: float | None = None) -> None:
-        super().__init__(f"AboutAccountQuery HTTP {status}")
+    def __init__(self, status: int = 429, retry_after: float | None = None, operation: str = "AboutAccountQuery") -> None:
+        super().__init__(f"{operation} HTTP {status}")
         self.status = status
         self.retry_after = retry_after
+        self.operation = operation
 
 
 def _retry_after_seconds(headers: dict[str, object]) -> float | None:
@@ -47,6 +50,23 @@ def _retry_after_seconds(headers: dict[str, object]) -> float | None:
         except ValueError:
             pass
     return None
+
+
+def _rate_limit_state(headers: dict[str, object]) -> dict[str, float]:
+    state: dict[str, float] = {}
+    for header, key in (
+        ("x-rate-limit-limit", "limit"),
+        ("x-rate-limit-remaining", "remaining"),
+        ("x-rate-limit-reset", "reset"),
+    ):
+        value = str(headers.get(header, "") or "").strip()
+        if not value:
+            continue
+        try:
+            state[key] = float(value)
+        except ValueError:
+            continue
+    return state
 
 
 def set_shared_about_cooldown(seconds: float, reason: str) -> float:
@@ -85,14 +105,16 @@ def wait_for_shared_about_cooldown(payload: dict[str, object], output_dir: Path)
 POST_FIELDS = [
     "keyword", "keyword_index", "rank", "post_id", "post_url", "post_text",
     "posted_at", "time_label", "author_username", "author_display_name",
-    "author_user_id", "account_based_in", "source", "account_lookup_status",
+    "author_user_id", "profile_location", "profile_location_status", "profile_location_error", "profile_location_collected_at",
+    "account_based_in", "source", "account_lookup_status",
     "collected_at",
 ]
 
 DEDUP_FIELDS = [
     "post_id", "post_url", "post_text", "posted_at", "time_label",
     "author_username", "author_display_name", "author_user_id",
-    "account_based_in", "matched_keywords", "keyword_count", "source",
+    "profile_location", "profile_location_status", "profile_location_error", "profile_location_collected_at", "account_based_in",
+    "matched_keywords", "keyword_count", "source",
     "account_lookup_status", "collected_at",
 ]
 
@@ -135,6 +157,85 @@ def build_search_query(keyword: str, start_date: date | None, end_date: date | N
         # Current X web search treats the selected "to" date as inclusive.
         parts.append(f"until:{end_date.isoformat()}")
     return " ".join(parts)
+
+
+def search_run_key(run: dict[str, object]) -> tuple[str, str, str]:
+    return (
+        str(run.get("keyword", "")),
+        str(run.get("slice_start", "")),
+        str(run.get("slice_end", "")),
+    )
+
+
+def search_run_needs_retry(run: dict[str, object]) -> bool:
+    return (
+        str(run.get("stop_reason", "")) in RETRYABLE_SEARCH_STOP_REASONS
+        or str(run.get("coverage_status", "")) == "needs_retry"
+    )
+
+
+def reliable_search_keys(search_runs: object) -> set[tuple[str, str, str]]:
+    if not isinstance(search_runs, list):
+        return set()
+    return {
+        search_run_key(run)
+        for run in search_runs
+        if isinstance(run, dict) and not search_run_needs_retry(run)
+    }
+
+
+def search_repair_queue(search_runs: object) -> list[dict[str, object]]:
+    """Return unresolved date slices that must be replayed before completion."""
+    if not isinstance(search_runs, list):
+        return []
+    reliable = reliable_search_keys(search_runs)
+    grouped: dict[tuple[str, str, str], list[dict[str, object]]] = {}
+    for run in search_runs:
+        if not isinstance(run, dict) or not search_run_needs_retry(run):
+            continue
+        key = search_run_key(run)
+        if key in reliable:
+            continue
+        grouped.setdefault(key, []).append(run)
+    queue: list[dict[str, object]] = []
+    for key, attempts in grouped.items():
+        latest = attempts[-1]
+        queue.append({
+            "keyword": key[0],
+            "keyword_index": int(latest.get("keyword_index", 0) or 0),
+            "slice_start": key[1],
+            "slice_end": key[2],
+            "attempts": len(attempts),
+            "last_stop_reason": str(latest.get("stop_reason", "")),
+            "partial_post_count": max(int(run.get("count", 0) or 0) for run in attempts),
+            "last_attempt_at": str(latest.get("completed_at", "")),
+            "status": "pending",
+        })
+    return sorted(queue, key=lambda row: (int(row.get("keyword_index", 0)), str(row.get("slice_start", ""))))
+
+
+def profile_location_needs_lookup(author: object) -> bool:
+    if not isinstance(author, dict) or not str(author.get("username", "") or "").strip():
+        return False
+    if str(author.get("profile_location", "") or "").strip():
+        return False
+    return str(author.get("profile_location_status", "pending") or "pending") not in {"success", "empty"}
+
+
+def profile_location_queue(authors: object) -> list[dict[str, object]]:
+    if not isinstance(authors, dict):
+        return []
+    rows = []
+    for author in authors.values():
+        if not profile_location_needs_lookup(author):
+            continue
+        rows.append({
+            "username": str(author.get("username", "") or ""),
+            "user_id": str(author.get("user_id", "") or ""),
+            "status": str(author.get("profile_location_status", "pending") or "pending"),
+            "error": str(author.get("profile_location_error", "") or ""),
+        })
+    return sorted(rows, key=lambda item: str(item["username"]).casefold())
 
 
 def post_in_date_range(posted_at: str, start_date: date | None, end_date: date | None, timezone_offset: float = 8) -> bool:
@@ -228,6 +329,10 @@ def extract_visible_posts(page, keyword: str, keyword_index: int) -> list[dict[s
             "author_username": author_username,
             "author_display_name": display_name,
             "author_user_id": "",
+            "profile_location": "",
+            "profile_location_status": "pending",
+            "profile_location_error": "",
+            "profile_location_collected_at": "",
             "account_based_in": "",
             "source": "about_this_account",
             "account_lookup_status": "pending",
@@ -256,7 +361,10 @@ def deduplicate_posts(posts: list[dict[str, object]]) -> list[dict[str, object]]
         if keyword and keyword.casefold() not in {item.casefold() for item in keyword_lists[identity]}:
             keyword_lists[identity].append(keyword)
         current = merged[identity]
-        for field in ("author_user_id", "account_based_in", "author_display_name"):
+        for field in (
+            "author_user_id", "profile_location", "profile_location_status", "profile_location_error", "profile_location_collected_at",
+            "account_based_in", "author_display_name",
+        ):
             if not current.get(field) and post.get(field):
                 current[field] = post[field]
         if current.get("account_lookup_status") in {"pending", "failed", ""} and post.get("account_lookup_status") in {"success", "unknown"}:
@@ -326,15 +434,17 @@ def report_html(posts: list[dict[str, object]], payload: dict[str, object], run_
     dates.sort(key=lambda row: str(row["date"]))
     coverage = [run for run in payload.get("search_runs", []) if isinstance(run, dict)]
     exhausted_count = sum(run.get("coverage_status") == "apparently_exhausted" for run in coverage)
-    truncated_count = sum(run.get("coverage_status") == "truncated" for run in coverage)
+    truncated_count = sum(run.get("coverage_status") in {"truncated", "needs_retry"} for run in coverage)
     coverage_rows = "".join(
-        "<tr><td>{}</td><td>{} — {}</td><td>{}</td><td>{}</td><td>{}</td><td><span class='tag {}'>{}</span></td></tr>".format(
+        "<tr><td>{}</td><td>{} — {}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><span class='tag {}'>{}</span></td></tr>".format(
             html.escape(str(run.get("keyword", ""))), html.escape(str(run.get("slice_start", "开放")) or "开放"),
-            html.escape(str(run.get("slice_end", "开放")) or "开放"), run.get("count", 0), run.get("scrolls_used", ""),
+            html.escape(str(run.get("slice_end", "开放")) or "开放"), run.get("count", 0),
+            f"{run.get('operation_name', 'SearchTimeline')} · JSON {run.get('json_pages_used', 0)} 页" if run.get("search_engine") == "graphql" else f"滚动 {run.get('scrolls_used', '')} 次",
+            f"{run.get('elapsed_seconds', 0):.1f} 秒 · {run.get('posts_per_minute', 0):.1f} 条/分" if isinstance(run.get("elapsed_seconds"), (int, float)) else "旧版未记录",
             html.escape(str(run.get("stop_reason", "旧版记录"))), "ok" if run.get("coverage_status") == "apparently_exhausted" else "warn",
-            "滚动无新增" if run.get("coverage_status") == "apparently_exhausted" else "被预算截断",
+            "看似已到尽头" if run.get("coverage_status") == "apparently_exhausted" else "等待异常重跑" if search_run_needs_retry(run) else "被预算截断",
         ) for run in coverage
-    ) or "<tr><td colspan='6'>暂无覆盖记录</td></tr>"
+    ) or "<tr><td colspan='7'>暂无覆盖记录</td></tr>"
     known = sum(bool(row.get("account_based_in")) for row in deduped)
     known_rate = round(known * 100 / len(deduped), 1) if deduped else 0
     known_countries = [row for row in countries if str(row["country"]) != "Unknown"]
@@ -346,9 +456,11 @@ def report_html(posts: list[dict[str, object]], payload: dict[str, object], run_
     keyword_options = "".join(
         f"<option value='{html.escape(name.casefold(), quote=True)}'>{html.escape(name)}</option>" for name in keyword_names
     )
-    resolved_authors = len([row for row in payload.get("authors", {}).values() if isinstance(row, dict)]) if isinstance(payload.get("authors"), dict) else 0
+    resolved_authors = len([row for row in payload.get("authors", {}).values() if isinstance(row, dict) and row.get("status") != "pending"]) if isinstance(payload.get("authors"), dict) else 0
     unique_author_count = len({str(row.get("author_username", "")).casefold() for row in deduped if row.get("author_username")})
-    if payload.get("finalized"):
+    if payload.get("active_phase") == "completed_with_author_backlog":
+        location_notice = f"帖子采集已完成：已安全保存 {unique_author_count} 位作者的用户名、稳定用户 ID（如搜索响应提供）和自填位置；Account based in 尚待后台补全。"
+    elif payload.get("finalized"):
         location_notice = f"作者所在地核验已完成：已查询 {resolved_authors} 位去重作者；没有国家值的账号表示 X 未公开或查询未成功。"
     else:
         location_notice = f"本批次尚未完成，当前已查询 {resolved_authors} / {unique_author_count} 位去重作者。没有国家值的帖子显示为“待查询”，不再误标为 Unknown。"
@@ -364,13 +476,13 @@ def report_html(posts: list[dict[str, object]], payload: dict[str, object], run_
     template = r"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>X 关键词研究工作台</title>
 <style>:root{--navy:#132433;--navy2:#1c3447;--blue:#1677ff;--bg:#f3f6f9;--panel:#fff;--line:#d8e2eb;--text:#172033;--muted:#657789;--green:#16865d}*{box-sizing:border-box}html,body{height:100%}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,'Microsoft YaHei',sans-serif}.shell{display:grid;grid-template-columns:240px 1fr;height:100%}aside{position:sticky;top:0;height:100vh;background:var(--navy);color:white;padding:24px 18px}.brand{font-weight:800;font-size:19px;margin:0 8px 28px}.brand small{display:block;color:#aac0d0;font-size:11px;margin-top:5px;font-weight:500}.nav a{display:block;color:#c9d8e3;text-decoration:none;padding:11px 12px;border-radius:8px;margin:4px 0}.nav a.active{background:var(--blue);color:#fff}.side-note{position:absolute;left:18px;right:18px;bottom:20px;color:#9fb4c4;font-size:12px;line-height:1.6}.content{height:100vh;overflow:auto}header{position:sticky;top:0;z-index:4;background:rgba(255,255,255,.97);border-bottom:1px solid var(--line);padding:12px 24px;display:flex;justify-content:space-between;align-items:center;gap:16px}header h1{font-size:20px;margin:0}header span{color:var(--muted);font-size:13px}.top-actions{display:flex;align-items:center;gap:9px}.top-actions select{min-width:270px}main{padding:22px 24px 40px;max-width:1600px}.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:11px}.card{padding:16px}.card span{color:var(--muted);font-size:12px}.card b{display:block;font-size:28px;margin:5px 0}.card em{font-size:12px;color:var(--green);font-style:normal}.notice{margin-top:14px;padding:13px 15px;border:1px solid #efcf75;background:#fff8df;color:#735100;border-radius:10px;line-height:1.6}.charts{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}.panel{padding:18px}.panel h2{font-size:16px;margin:0 0 14px}.panel svg{width:100%;height:auto}.panel svg text{font-size:11px;fill:var(--muted)}.panel svg rect{fill:#8fbdf5}.panel svg .value{fill:var(--text);font-weight:700}.panel svg .timeline{fill:none;stroke:#1677ff;stroke-width:3}.panel svg circle{fill:#1677ff}.exports{display:flex;gap:8px;flex-wrap:wrap}.button{display:inline-block;background:var(--navy2);color:#fff;text-decoration:none;border:0;border-radius:7px;padding:9px 12px;font-weight:700;cursor:pointer;font-size:13px}.button.secondary{background:#e8eef3;color:var(--navy)}.toolbar{position:sticky;top:62px;z-index:3;background:#fff;padding:10px 0;display:grid;grid-template-columns:minmax(230px,1fr) 170px 170px 145px 145px auto;gap:9px;margin:4px 0 10px}input,select{width:100%;padding:10px 11px;border:1px solid #adbdca;border-radius:7px;background:#fff}.table{overflow:auto;border:1px solid var(--line);border-radius:9px;max-height:620px}table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:9px 10px;border-bottom:1px solid #e6edf2;text-align:left;vertical-align:top}th{position:sticky;top:0;background:var(--navy2);color:white;z-index:2;white-space:nowrap}.post{min-width:340px;white-space:normal;line-height:1.5}.plain{color:#1264b3}.split{display:grid;grid-template-columns:1fr 360px;gap:14px;margin-top:14px}.empty{color:var(--muted)}.count{color:var(--muted);font-size:13px;margin-left:8px}.tag{display:inline-block;padding:4px 8px;border-radius:12px;background:#fff0dd;color:#8a4c00}.tag.ok{background:#e1f5e9;color:#116d3d}.pager{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:10px}.pager button:disabled{opacity:.45;cursor:not-allowed}@media(max-width:1200px){.toolbar{grid-template-columns:1fr 1fr 1fr}}@media(max-width:1000px){.shell{grid-template-columns:1fr}aside{display:none}.kpis{grid-template-columns:repeat(2,1fr)}.charts,.split{grid-template-columns:1fr}.toolbar{position:static;grid-template-columns:1fr 1fr}.content{height:auto}header{position:relative;align-items:flex-start;flex-direction:column}.top-actions{width:100%;flex-wrap:wrap}.top-actions select{min-width:220px;flex:1}}@media(max-width:600px){.kpis,.toolbar{grid-template-columns:1fr}main{padding:14px}}</style></head>
 <style>:root{--navy:#2c2825;--navy2:#39322e;--blue:#c86143;--bg:#f3efe7;--panel:#fffdf9;--line:#ddd5c9;--text:#302c28;--muted:#756e66;--green:#287a55}body{background:radial-gradient(circle at 80% 0,#eadfd2 0,transparent 29%),var(--bg)}aside{background:linear-gradient(180deg,#2c2825,#211e1c);padding:28px 18px}.brand{font-family:Georgia,'Songti SC',serif;font-size:21px}.brand small{color:#c9bbae}.nav a{color:#ded5cd;border:1px solid transparent}.nav a:hover{background:#3b3531;border-color:#4b433e}.nav a.active{background:#c86143}.side-note{color:#ae9f93}header{background:rgba(248,245,238,.94);backdrop-filter:blur(14px)}header h1{font-family:Georgia,'Songti SC',serif;font-size:22px}.card,.panel{border-color:var(--line);border-radius:18px;box-shadow:0 12px 34px rgba(77,61,47,.055)}.card{padding:18px}.card b{font-family:Georgia,serif;font-size:31px}.button{border-radius:10px;background:#38312d}.button.secondary{background:#eee8df;color:#4b433d}.notice{background:#fff6dc;border-color:#e5c77c;border-radius:14px}.filter-shell{padding:16px;border:1px solid var(--line);border-radius:15px;background:#f8f5ef;margin-bottom:13px}.filter-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:11px}.filter-field{display:flex;flex-direction:column;gap:6px;min-width:0;color:var(--muted);font-size:12px;font-weight:700}.filter-field.wide{grid-column:span 2}.filter-field input,.filter-field select{height:42px;min-width:0;border-color:#c9bfb2;border-radius:10px;background:#fffdf9;color:var(--text)}.filter-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:12px}.filter-actions .hint{color:var(--muted);font-size:12px}.filter-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:0 0 13px}.filter-stat{padding:13px 15px;border-radius:13px;background:#f3eee6;border:1px solid #e2d9cd;color:var(--muted);font-size:12px}.filter-stat b{display:block;color:var(--text);font:700 22px/1.1 Georgia,serif;margin-bottom:3px}.table{border-color:var(--line);border-radius:13px}th{background:#39322e}th,td{padding:10px 11px}.pager{justify-content:space-between}.pager-center{color:var(--muted);font-size:13px}.toolbar{position:static}.plain{color:#a84f35;font-weight:700}@media(max-width:1180px){.filter-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:640px){.filter-grid,.filter-summary{grid-template-columns:1fr}.filter-field.wide{grid-column:span 1}.filter-actions{align-items:flex-start;flex-direction:column}}</style>
-<body><div class='shell'><aside data-od-id='sidebar'><div class='brand'>X Research Lab<small>关键词帖子研究工作台</small></div><nav class='nav'><a href='/'>← 返回采集工作台</a><a class='active' href='#overview'>研究概览</a><a href='#dataset'>筛选帖子</a><a href='#coverage'>覆盖诊断</a><a href='#distribution'>分组统计</a><a href='posts.csv'>原始命中</a><a href='research_coding_template.csv'>编码模板</a><a href='all_exports.zip'>完整导出</a></nav><div class='side-note'>Account based in 来源：<br>About this account<br><br>页面生成时间：__UPDATED__</div></aside>
+<body><div class='shell'><aside data-od-id='sidebar'><div class='brand'>X Research Lab<small>关键词帖子研究工作台</small></div><nav class='nav'><a href='/'>← 返回采集工作台</a><a class='active' href='#overview'>研究概览</a><a href='#dataset'>筛选帖子</a><a href='#coverage'>覆盖诊断</a><a href='#distribution'>分组统计</a><a href='posts.csv'>原始命中</a><a href='research_coding_template.csv'>编码模板</a><a href='all_exports.zip'>完整导出</a></nav><div class='side-note'>Profile Location：用户自填<br>Account based in：X 聚合 IP 推断<br><br>页面生成时间：__UPDATED__</div></aside>
 <div class='content'><header data-od-id='topbar'><div><h1>X / Twitter 关键词研究结果</h1><span>批次 __RUN_ID__ · 原始记录保留 · 研究样本自动去重</span></div><div class='top-actions'><select id='runSwitcher' aria-label='切换历史批次'><option value=''>正在载入历史批次…</option></select><a class='button' href='#dataset'>筛选帖子</a></div></header><main>
 <section id='overview' class='kpis' data-od-id='kpi-cards'><div class='card'><span>去重帖子</span><b>__DEDUP_COUNT__</b><em>按 post_id 自动合并</em></div><div class='card'><span>原始关键词命中</span><b>__RAW_COUNT__</b><em>保留交叉命中关系</em></div><div class='card'><span>去重作者</span><b>__AUTHOR_COUNT__</b><em>作者所在地只查一次</em></div><div class='card'><span>所在地有效率</span><b>__KNOWN_RATE__%</b><em>__KNOWN_COUNT__ / __DEDUP_COUNT__ 条</em></div></section>
 <div class='notice' id='locationNotice'><strong>所在地状态：</strong>__LOCATION_NOTICE__</div>
 <section class='panel' style='margin-top:14px' data-od-id='exports'><h2>一键导出</h2><div class='exports'><a class='button' href='all_exports.zip'>下载全部 ZIP</a><a class='button secondary' href='posts_deduplicated.csv'>去重样本 CSV</a><a class='button secondary' href='posts.csv'>原始命中 CSV</a><a class='button secondary' href='research_dataset.json'>研究样本 JSON</a><a class='button secondary' href='research_coding_template.csv'>内容编码模板</a><button class='button secondary' id='filteredExport'>导出当前筛选</button></div></section>
-<section id='dataset' class='panel' style='margin-top:14px' data-od-id='dataset'><h2>帖子筛选与浏览 <span class='count' id='visibleCount'></span></h2><div class='filter-shell'><div class='filter-grid'><label class='filter-field wide'><span>正文或关键词</span><input id='search' placeholder='输入 GPT、模型名称或正文片段'></label><label class='filter-field'><span>作者用户名</span><input id='authorSearch' placeholder='例如 openai'></label><label class='filter-field'><span>所在地状态</span><select id='locationStatus'><option value=''>全部状态</option><option value='known'>已有国家/地区</option><option value='__pending__'>待查询</option><option value='__unavailable__'>X 未公开</option><option value='__failed__'>查询失败</option></select></label><label class='filter-field'><span>国家 / 地区</span><select id='country'><option value=''>全部国家/地区</option>__COUNTRY_OPTIONS__</select></label><label class='filter-field'><span>命中关键词</span><select id='keyword'><option value=''>全部关键词</option>__KEYWORD_OPTIONS__</select></label><label class='filter-field'><span>发帖日期从</span><input id='dateFrom' type='date'></label><label class='filter-field'><span>发帖日期至</span><input id='dateTo' type='date'></label><label class='filter-field'><span>排序</span><select id='sortOrder'><option value='newest'>时间：最新优先</option><option value='oldest'>时间：最早优先</option><option value='author'>作者：A–Z</option><option value='country'>国家：A–Z</option></select></label><label class='filter-field'><span>每页显示</span><select id='pageSize'><option value='25'>25 条</option><option value='50'>50 条</option><option value='100' selected>100 条</option><option value='250'>250 条</option></select></label></div><div class='filter-actions'><span class='hint' id='activeFilterSummary'>当前显示全部去重帖子</span><button class='button secondary' id='reset'>清除全部筛选</button></div></div><div class='filter-summary'><div class='filter-stat'><b id='filteredCount'>0</b>筛选后帖子</div><div class='filter-stat'><b id='filteredAuthors'>0</b>筛选后作者</div><div class='filter-stat'><b id='filteredCountries'>0</b>筛选后国家 / 地区</div></div><div class='table'><table><thead><tr><th>命中关键词</th><th>帖子原文</th><th>发帖时间</th><th>作者</th><th>账号所在地</th><th>帖子 ID</th><th>链接</th></tr></thead><tbody id='rows'></tbody></table></div><div class='pager'><button class='button secondary' id='prevPage'>上一页</button><span class='pager-center' id='pageInfo'>第 1 页</span><button class='button secondary' id='nextPage'>下一页</button></div></section>
-<section id='coverage' class='panel' style='margin-top:14px'><h2>搜索覆盖诊断</h2><p class='empty'>X 不提供总命中数。“滚动无新增”表示本次网页会话看起来已到底，但不等于平台数据库绝对全量；“被预算截断”表示目标条数或滚动上限先到了。</p><div class='exports'><span class='button secondary'>搜索片 __SLICE_COUNT__</span><span class='button secondary'>滚动无新增 __EXHAUSTED_COUNT__</span><span class='button secondary'>被预算截断 __TRUNCATED_COUNT__</span><a class='button secondary' href='coverage_report.csv'>下载覆盖报告</a></div><div class='table' style='max-height:320px;margin-top:12px'><table><thead><tr><th>关键词</th><th>日期片</th><th>帖子数</th><th>滚动次数</th><th>停止原因</th><th>诊断</th></tr></thead><tbody>__COVERAGE_ROWS__</tbody></table></div></section>
+<section id='dataset' class='panel' style='margin-top:14px' data-od-id='dataset'><h2>帖子筛选与浏览 <span class='count' id='visibleCount'></span></h2><div class='filter-shell'><div class='filter-grid'><label class='filter-field wide'><span>正文或关键词</span><input id='search' placeholder='输入 GPT、模型名称或正文片段'></label><label class='filter-field'><span>作者用户名</span><input id='authorSearch' placeholder='例如 openai'></label><label class='filter-field'><span>所在地状态</span><select id='locationStatus'><option value=''>全部状态</option><option value='known'>已有国家/地区</option><option value='__pending__'>待查询</option><option value='__unavailable__'>X 未公开</option><option value='__failed__'>查询失败</option></select></label><label class='filter-field'><span>国家 / 地区</span><select id='country'><option value=''>全部国家/地区</option>__COUNTRY_OPTIONS__</select></label><label class='filter-field'><span>命中关键词</span><select id='keyword'><option value=''>全部关键词</option>__KEYWORD_OPTIONS__</select></label><label class='filter-field'><span>发帖日期从</span><input id='dateFrom' type='date'></label><label class='filter-field'><span>发帖日期至</span><input id='dateTo' type='date'></label><label class='filter-field'><span>排序</span><select id='sortOrder'><option value='newest'>时间：最新优先</option><option value='oldest'>时间：最早优先</option><option value='author'>作者：A–Z</option><option value='country'>国家：A–Z</option></select></label><label class='filter-field'><span>每页显示</span><select id='pageSize'><option value='25'>25 条</option><option value='50'>50 条</option><option value='100' selected>100 条</option><option value='250'>250 条</option></select></label></div><div class='filter-actions'><span class='hint' id='activeFilterSummary'>当前显示全部去重帖子</span><button class='button secondary' id='reset'>清除全部筛选</button></div></div><div class='filter-summary'><div class='filter-stat'><b id='filteredCount'>0</b>筛选后帖子</div><div class='filter-stat'><b id='filteredAuthors'>0</b>筛选后作者</div><div class='filter-stat'><b id='filteredCountries'>0</b>筛选后国家 / 地区</div></div><div class='table'><table><thead><tr><th>命中关键词</th><th>帖子原文</th><th>发帖时间</th><th>作者</th><th>自填位置</th><th>Account based in</th><th>帖子 ID</th><th>链接</th></tr></thead><tbody id='rows'></tbody></table></div><div class='pager'><button class='button secondary' id='prevPage'>上一页</button><span class='pager-center' id='pageInfo'>第 1 页</span><button class='button secondary' id='nextPage'>下一页</button></div></section>
+<section id='coverage' class='panel' style='margin-top:14px'><h2>搜索覆盖诊断</h2><p class='empty'>X 不提供总命中数。cursor 或滚动无新增表示本次搜索看起来已到底，但不等于平台数据库绝对全量；“被预算截断”表示目标条数或页数上限先到了。</p><div class='exports'><span class='button secondary'>搜索片 __SLICE_COUNT__</span><span class='button secondary'>看似已到尽头 __EXHAUSTED_COUNT__</span><span class='button secondary'>被预算截断 __TRUNCATED_COUNT__</span><a class='button secondary' href='coverage_report.csv'>下载覆盖报告</a></div><div class='table' style='max-height:320px;margin-top:12px'><table><thead><tr><th>关键词</th><th>日期片</th><th>帖子数</th><th>翻页方式</th><th>耗时 / 实测速率</th><th>停止原因</th><th>诊断</th></tr></thead><tbody>__COVERAGE_ROWS__</tbody></table></div></section>
 <section id='distribution' class='charts' data-od-id='charts'><article class='panel'><h2>账号所在地分布</h2>__COUNTRY_CHART__</article><article class='panel'><h2>关键词命中分布</h2>__KEYWORD_CHART__</article></section><section class='panel' style='margin-top:14px'><h2>帖子时间分布（最近 14 个有数据日期）</h2>__TIMELINE_CHART__</section>
 <section class='panel' style='margin-top:14px'><h2>高频作者</h2><table><thead><tr><th>作者</th><th>帖子数</th><th>占比</th></tr></thead><tbody>__AUTHOR_ROWS__</tbody></table><p class='empty'>分组明细同时输出为 country_summary.csv、keyword_summary.csv 和 author_summary.csv。</p></section>
 </main></div></div><script>
@@ -379,10 +491,10 @@ const byId=id=>document.getElementById(id),q=byId('search'),authorSearch=byId('a
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function locationKey(r){if(r.account_based_in)return String(r.account_based_in).toLowerCase();if(r.account_lookup_status==='unknown')return'__unavailable__';if(r.account_lookup_status==='failed')return'__failed__';return'__pending__'}
 function locationLabel(r){if(r.account_based_in)return String(r.account_based_in);if(r.account_lookup_status==='unknown')return'X 未公开';if(r.account_lookup_status==='failed')return'查询失败';return'待查询'}
-function render(){const pages=Math.max(1,Math.ceil(filtered.length/pageSize));page=Math.min(Math.max(1,page),pages);const start=(page-1)*pageSize;rows.innerHTML=filtered.slice(start,start+pageSize).map(r=>`<tr data-country="${esc(locationKey(r))}" data-keywords="${esc(String(r.matched_keywords||'').toLowerCase())}" data-date="${esc(String(r.posted_at||'').slice(0,10))}"><td>${esc(r.matched_keywords)}</td><td class="post">${esc(r.post_text)}</td><td>${esc(r.posted_at)}</td><td>@${esc(r.author_username)}</td><td>${esc(locationLabel(r))}</td><td>${esc(r.post_id)}</td><td><a class="plain" target="_blank" rel="noopener" href="${esc(r.post_url)}">打开</a></td></tr>`).join('');visible.textContent=`筛选结果 ${filtered.length} / ${dataset.length} 条`;byId('filteredCount').textContent=filtered.length;byId('filteredAuthors').textContent=new Set(filtered.map(r=>String(r.author_username||'').toLowerCase()).filter(Boolean)).size;byId('filteredCountries').textContent=new Set(filtered.filter(r=>r.account_based_in).map(r=>String(r.account_based_in).toLowerCase())).size;byId('pageInfo').textContent=`第 ${page} / ${pages} 页 · 每页 ${pageSize} 条`;byId('prevPage').disabled=page<=1;byId('nextPage').disabled=page>=pages}
+function render(){const pages=Math.max(1,Math.ceil(filtered.length/pageSize));page=Math.min(Math.max(1,page),pages);const start=(page-1)*pageSize;rows.innerHTML=filtered.slice(start,start+pageSize).map(r=>`<tr data-country="${esc(locationKey(r))}" data-keywords="${esc(String(r.matched_keywords||'').toLowerCase())}" data-date="${esc(String(r.posted_at||'').slice(0,10))}"><td>${esc(r.matched_keywords)}</td><td class="post">${esc(r.post_text)}</td><td>${esc(r.posted_at)}</td><td>@${esc(r.author_username)}</td><td>${esc(r.profile_location||'—')}</td><td>${esc(locationLabel(r))}</td><td>${esc(r.post_id)}</td><td><a class="plain" target="_blank" rel="noopener" href="${esc(r.post_url)}">打开</a></td></tr>`).join('');visible.textContent=`筛选结果 ${filtered.length} / ${dataset.length} 条`;byId('filteredCount').textContent=filtered.length;byId('filteredAuthors').textContent=new Set(filtered.map(r=>String(r.author_username||'').toLowerCase()).filter(Boolean)).size;byId('filteredCountries').textContent=new Set(filtered.filter(r=>r.account_based_in).map(r=>String(r.account_based_in).toLowerCase())).size;byId('pageInfo').textContent=`第 ${page} / ${pages} 页 · 每页 ${pageSize} 条`;byId('prevPage').disabled=page<=1;byId('nextPage').disabled=page>=pages}
 function apply(){const term=q.value.trim().toLowerCase(),author=authorSearch.value.trim().replace(/^@/,'').toLowerCase(),status=locationStatus.value,c=country.value,k=keyword.value,from=dateFrom.value,to=dateTo.value;pageSize=Number(pageSizeControl.value)||100;filtered=dataset.filter(r=>{const d=String(r.posted_at||'').slice(0,10),hay=[r.post_text,r.matched_keywords].join(' ').toLowerCase(),authorName=String(r.author_username||'').toLowerCase(),loc=locationKey(r);return(!term||hay.includes(term))&&(!author||authorName.includes(author))&&(!status||(status==='known'?Boolean(r.account_based_in):loc===status))&&(!c||loc===c)&&(!k||String(r.matched_keywords||'').toLowerCase().split(' | ').includes(k))&&(!from||!d||d>=from)&&(!to||!d||d<=to)});const order=sortOrder.value,cmpText=(a,b)=>String(a||'').localeCompare(String(b||''),'zh-CN',{sensitivity:'base'});filtered.sort((a,b)=>order==='oldest'?cmpText(a.posted_at,b.posted_at):order==='author'?cmpText(a.author_username,b.author_username):order==='country'?cmpText(locationLabel(a),locationLabel(b)):cmpText(b.posted_at,a.posted_at));const active=[term,author,status,c,k,from,to].filter(Boolean).length;byId('activeFilterSummary').textContent=active?`已启用 ${active} 个筛选条件；可导出当前结果`:'当前显示全部去重帖子';page=1;render()}
 for(const control of[q,authorSearch])control.addEventListener('input',apply);for(const control of[locationStatus,country,keyword,dateFrom,dateTo,sortOrder,pageSizeControl])control.addEventListener('change',apply);byId('reset').onclick=()=>{q.value='';authorSearch.value='';locationStatus.value='';country.value='';keyword.value='';dateFrom.value='';dateTo.value='';sortOrder.value='newest';pageSizeControl.value='100';apply()};byId('prevPage').onclick=()=>{page--;render()};byId('nextPage').onclick=()=>{page++;render()};
-function csvCell(v){const s=String(v??'');return '"'+s.replaceAll('"','""')+'"'}byId('filteredExport').onclick=()=>{const fields=['post_id','post_url','post_text','posted_at','author_username','author_user_id','account_based_in','matched_keywords','account_lookup_status'];const csv='\ufeff'+[fields.join(','),...filtered.map(r=>fields.map(f=>csvCell(r[f])).join(','))].join('\r\n');const a=document.createElement('a'),url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));a.href=url;a.download='filtered_posts.csv';a.style.display='none';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000)};
+function csvCell(v){const s=String(v??'');return '"'+s.replaceAll('"','""')+'"'}byId('filteredExport').onclick=()=>{const fields=['post_id','post_url','post_text','posted_at','author_username','author_user_id','profile_location','account_based_in','matched_keywords','account_lookup_status'];const csv='\ufeff'+[fields.join(','),...filtered.map(r=>fields.map(f=>csvCell(r[f])).join(','))].join('\r\n');const a=document.createElement('a'),url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));a.href=url;a.download='filtered_posts.csv';a.style.display='none';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000)};
 async function loadRuns(){const select=byId('runSwitcher');try{const response=await fetch('/api/history'),data=await response.json();select.innerHTML=data.runs.map(r=>`<option value="${esc(r.run_id)}" ${r.run_id===runId?'selected':''}>${esc(r.run_id)} · ${esc((r.keywords||[]).join('、')||'无关键词')} · ${r.post_count} 条 · ${r.status==='completed'?'已完成':'未完成'}</option>`).join('');select.onchange=()=>{if(select.value&&select.value!==runId)location.href='/results/'+encodeURIComponent(select.value)+'/index.html'}}catch{select.innerHTML=`<option value="${esc(runId)}">批次 ${esc(runId)}</option>`}}async function init(){if(!dataset.length&&totalExpected){visible.textContent='正在载入帖子数据…';try{const response=await fetch('research_dataset.json');dataset=await response.json()}catch{visible.textContent='帖子数据载入失败，请返回采集工作台重试';return}}loadRuns();apply()}init();
 </script></body></html>"""
     replacements = {
@@ -390,7 +502,7 @@ async function loadRuns(){const select=byId('runSwitcher');try{const response=aw
         "__DEDUP_COUNT__": str(len(deduped)), "__RAW_COUNT__": str(len(posts)),
         "__AUTHOR_COUNT__": str(len(authors)), "__KNOWN_RATE__": str(known_rate),
         "__KNOWN_COUNT__": str(known), "__COUNTRY_CHART__": bar_chart_svg(countries, "country", "账号所在地分布"),
-        "__SLICE_COUNT__": str(len(coverage)), "__EXHAUSTED_COUNT__": str(exhausted_count), "__TRUNCATED_COUNT__": str(truncated_count), "__COVERAGE_ROWS__": coverage_rows,
+        "__SLICE_COUNT__": str(len(reliable_search_keys(coverage))), "__EXHAUSTED_COUNT__": str(exhausted_count), "__TRUNCATED_COUNT__": str(truncated_count), "__COVERAGE_ROWS__": coverage_rows,
         "__KEYWORD_CHART__": bar_chart_svg(keywords, "keyword", "关键词命中分布"),
         "__TIMELINE_CHART__": timeline_chart_svg(dates),
         "__COUNTRY_OPTIONS__": country_options, "__KEYWORD_OPTIONS__": keyword_options,
@@ -403,6 +515,54 @@ async function loadRuns(){const select=byId('runSwitcher');try{const response=aw
     return template
 
 
+def _status_payload(payload: dict[str, object]) -> dict[str, object]:
+    coverage = list(payload.get("search_runs", []))
+    completed = reliable_search_keys(coverage)
+    repair_queue = search_repair_queue(coverage)
+    authors = payload.get("authors", {}) if isinstance(payload.get("authors"), dict) else {}
+    profile_queue = profile_location_queue(authors)
+    return {
+        "keyword_count": len(payload.get("requested_keywords", [])),
+        "completed_keywords": len(completed),
+        "post_count": len(payload.get("posts", [])),
+        "resolved_authors": sum(
+            isinstance(author, dict) and author.get("status") != "pending"
+            for author in payload.get("authors", {}).values()
+        ) if isinstance(payload.get("authors"), dict) else 0,
+        "search_slice_count": len(completed),
+        "search_attempt_count": len(coverage),
+        "repair_queue_count": len(repair_queue),
+        "profile_location_count": sum(bool(author.get("profile_location")) for author in authors.values() if isinstance(author, dict)),
+        "profile_location_backlog_count": len(profile_queue),
+        "apparently_exhausted_slices": sum(run.get("coverage_status") == "apparently_exhausted" for run in coverage if isinstance(run, dict)),
+        "truncated_slices": sum(run.get("coverage_status") == "truncated" for run in coverage if isinstance(run, dict)),
+        "finalized": bool(payload.get("finalized", False)),
+        "updated_at": now_iso(),
+    }
+
+
+def _write_json_atomic(path: Path, value: object) -> None:
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    for attempt in range(8):
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError:
+            if attempt >= 7:
+                raise
+            time.sleep(0.12 * (attempt + 1))
+
+
+def save_checkpoint(output_dir: Path, payload: dict[str, object]) -> None:
+    """Persist resumable state without rebuilding every research export."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_json_atomic(output_dir / "raw.json", payload)
+    _write_json_atomic(output_dir / "status.json", _status_payload(payload))
+    _write_json_atomic(output_dir / "repair_queue.json", search_repair_queue(payload.get("search_runs", [])))
+    _write_json_atomic(output_dir / "profile_location_queue.json", profile_location_queue(payload.get("authors", {})))
+
+
 def save_outputs(output_dir: Path, payload: dict[str, object]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     posts = list(payload.get("posts", []))
@@ -413,7 +573,9 @@ def save_outputs(output_dir: Path, payload: dict[str, object]) -> None:
     dates = count_rows([str(row.get("posted_at", ""))[:10] for row in deduped if row.get("posted_at")], "date")
     dates.sort(key=lambda row: str(row["date"]))
     coverage = list(payload.get("search_runs", []))
-    (output_dir / "raw.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json_atomic(output_dir / "raw.json", payload)
+    _write_json_atomic(output_dir / "repair_queue.json", search_repair_queue(coverage))
+    _write_json_atomic(output_dir / "profile_location_queue.json", profile_location_queue(payload.get("authors", {})))
     write_csv(output_dir / "posts.csv", posts)
     write_csv(output_dir / "posts_deduplicated.csv", deduped, DEDUP_FIELDS)
     write_csv(output_dir / "research_coding_template.csv", deduped, CODING_FIELDS)
@@ -421,25 +583,14 @@ def save_outputs(output_dir: Path, payload: dict[str, object]) -> None:
     write_csv(output_dir / "keyword_summary.csv", keywords, ["keyword", "count", "percent"])
     write_csv(output_dir / "author_summary.csv", authors, ["author", "count", "percent"])
     write_csv(output_dir / "posted_date_summary.csv", dates, ["date", "count", "percent"])
-    write_csv(output_dir / "coverage_report.csv", coverage, ["keyword", "keyword_index", "query", "slice_start", "slice_end", "count", "scrolls_used", "stop_reason", "coverage_status", "completed_at"])
+    write_csv(output_dir / "coverage_report.csv", coverage, ["keyword", "keyword_index", "query", "slice_start", "slice_end", "count", "search_engine", "request_transport", "request_method", "operation_name", "endpoint_path", "json_pages_used", "scrolls_used", "pagination_trigger_retries", "last_cursor", "started_at", "elapsed_seconds", "posts_per_minute", "stop_reason", "coverage_status", "rate_limit_limit", "rate_limit_remaining", "rate_limit_reset", "completed_at"])
     (output_dir / "research_dataset.json").write_text(json.dumps(deduped, ensure_ascii=False, indent=2), encoding="utf-8")
     (output_dir / "index.html").write_text(report_html(posts, payload, output_dir.name), encoding="utf-8")
-    status = {
-        "keyword_count": len(payload.get("requested_keywords", [])),
-        "completed_keywords": len(payload.get("search_runs", [])),
-        "post_count": len(posts),
-        "resolved_authors": len(payload.get("authors", {})),
-        "search_slice_count": len(coverage),
-        "apparently_exhausted_slices": sum(run.get("coverage_status") == "apparently_exhausted" for run in coverage if isinstance(run, dict)),
-        "truncated_slices": sum(run.get("coverage_status") == "truncated" for run in coverage if isinstance(run, dict)),
-        "finalized": bool(payload.get("finalized", False)),
-        "updated_at": now_iso(),
-    }
-    (output_dir / "status.json").write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json_atomic(output_dir / "status.json", _status_payload(payload))
     export_names = [
         "posts.csv", "posts_deduplicated.csv", "research_coding_template.csv",
         "country_summary.csv", "keyword_summary.csv", "author_summary.csv", "posted_date_summary.csv", "coverage_report.csv",
-        "research_dataset.json", "raw.json", "status.json", "index.html",
+        "research_dataset.json", "raw.json", "status.json", "repair_queue.json", "profile_location_queue.json", "index.html",
     ]
     with zipfile.ZipFile(output_dir / "all_exports.zip", "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name in export_names:
@@ -520,6 +671,390 @@ def collect_search(page, keyword: str, keyword_index: int, limit: int, max_scrol
     return selected, coverage
 
 
+class SearchRateLimitError(RuntimeError):
+    def __init__(self, retry_after: float | None = None) -> None:
+        super().__init__("SearchTimeline HTTP 429")
+        self.retry_after = retry_after
+
+
+def _nested_dict(value: object, *keys: str) -> dict[str, object]:
+    current = value
+    for key in keys:
+        if not isinstance(current, dict):
+            return {}
+        current = current.get(key)
+    return current if isinstance(current, dict) else {}
+
+
+def _unwrap_tweet_result(result: object) -> dict[str, object]:
+    current = result
+    for _ in range(4):
+        if not isinstance(current, dict):
+            return {}
+        if isinstance(current.get("tweet"), dict) and not isinstance(current.get("legacy"), dict):
+            current = current["tweet"]
+            continue
+        if isinstance(current.get("result"), dict) and not isinstance(current.get("legacy"), dict):
+            current = current["result"]
+            continue
+        break
+    return current if isinstance(current, dict) else {}
+
+
+def _tweet_results(payload: object):
+    """Yield only primary timeline tweet results, not nested quote/retweet payloads."""
+    if isinstance(payload, dict):
+        tweet_results = payload.get("tweet_results")
+        if isinstance(tweet_results, dict) and isinstance(tweet_results.get("result"), dict):
+            yield _unwrap_tweet_result(tweet_results["result"])
+            return
+        for value in payload.values():
+            yield from _tweet_results(value)
+    elif isinstance(payload, list):
+        for value in payload:
+            yield from _tweet_results(value)
+
+
+def _bottom_cursor(payload: object) -> str:
+    candidates: list[str] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            entry_id = str(value.get("entryId", value.get("entry_id", "")) or "").casefold()
+            cursor_type = str(value.get("cursorType", value.get("cursor_type", "")) or "").casefold()
+            content = value.get("content") if isinstance(value.get("content"), dict) else value
+            cursor = ""
+            if isinstance(content, dict):
+                cursor = str(content.get("value", "") or "")
+                cursor_type = str(content.get("cursorType", content.get("cursor_type", cursor_type)) or cursor_type).casefold()
+            if cursor and ("cursor-bottom" in entry_id or cursor_type == "bottom"):
+                candidates.append(cursor)
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(payload)
+    return candidates[-1] if candidates else ""
+
+
+def _twitter_time_to_iso(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return email.utils.parsedate_to_datetime(text).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except (TypeError, ValueError):
+        return text
+
+
+def parse_search_timeline(payload: object, keyword: str, keyword_index: int) -> tuple[list[dict[str, object]], str]:
+    rows: list[dict[str, object]] = []
+    seen: set[str] = set()
+    collected_at = now_iso()
+    for raw_result in _tweet_results(payload):
+        result = _unwrap_tweet_result(raw_result)
+        legacy = result.get("legacy") if isinstance(result.get("legacy"), dict) else {}
+        post_id = str(result.get("rest_id") or legacy.get("id_str") or "")
+        if not post_id or post_id in seen:
+            continue
+        user_result = _nested_dict(result, "core", "user_results", "result")
+        if not user_result:
+            user_result = _nested_dict(result, "author_results", "result")
+        user_result = _unwrap_tweet_result(user_result)
+        user_legacy = user_result.get("legacy") if isinstance(user_result.get("legacy"), dict) else {}
+        user_core = user_result.get("core") if isinstance(user_result.get("core"), dict) else {}
+        user_location = user_result.get("location") if isinstance(user_result.get("location"), dict) else {}
+        profile_location = str(user_location.get("location") or user_legacy.get("location") or "")
+        username = str(user_core.get("screen_name") or user_legacy.get("screen_name") or "")
+        if not username:
+            continue
+        note = _nested_dict(result, "note_tweet", "note_tweet_results", "result")
+        text = str(note.get("text") or legacy.get("full_text") or legacy.get("text") or "").strip()
+        if not text:
+            continue
+        seen.add(post_id)
+        rows.append({
+            "keyword": keyword,
+            "keyword_index": keyword_index,
+            "rank": 0,
+            "post_id": post_id,
+            "post_url": f"https://x.com/{username}/status/{post_id}",
+            "post_text": text,
+            "posted_at": _twitter_time_to_iso(legacy.get("created_at")),
+            "time_label": "",
+            "author_username": username,
+            "author_display_name": str(user_core.get("name") or user_legacy.get("name") or ""),
+            "author_user_id": str(user_result.get("rest_id") or user_legacy.get("id_str") or ""),
+            "profile_location": profile_location,
+            "profile_location_status": "success" if profile_location else "pending",
+            "profile_location_error": "",
+            "profile_location_collected_at": collected_at if profile_location else "",
+            "account_based_in": "",
+            "source": "search_timeline_graphql",
+            "account_lookup_status": "pending",
+            "collected_at": collected_at,
+        })
+    return rows, _bottom_cursor(payload)
+
+
+def _search_url_with_cursor(url: str, cursor: str) -> str:
+    parts = urlsplit(url)
+    query = parse_qs(parts.query, keep_blank_values=True)
+    values = query.get("variables")
+    if not values:
+        raise RuntimeError("SearchTimeline 请求中没有 variables")
+    variables = json.loads(values[0])
+    if not isinstance(variables, dict):
+        raise RuntimeError("SearchTimeline variables 格式无效")
+    if cursor:
+        variables["cursor"] = cursor
+    else:
+        variables.pop("cursor", None)
+    query["variables"] = [json.dumps(variables, separators=(",", ":"), ensure_ascii=False)]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query, doseq=True), parts.fragment))
+
+
+def _search_raw_query(url: str, body: str | None = None) -> str:
+    """Extract rawQuery so a delayed response from an older date slice cannot be mistaken for the new one."""
+    try:
+        values = parse_qs(urlsplit(url).query, keep_blank_values=True).get("variables", [])
+        variables = json.loads(values[0]) if values else {}
+        if isinstance(variables, dict) and variables.get("rawQuery") is not None:
+            return str(variables["rawQuery"])
+    except (ValueError, TypeError, json.JSONDecodeError):
+        pass
+    if body:
+        try:
+            parsed = json.loads(body)
+            variables = parsed.get("variables", parsed) if isinstance(parsed, dict) else {}
+            if isinstance(variables, dict) and variables.get("rawQuery") is not None:
+                return str(variables["rawQuery"])
+        except (ValueError, TypeError, json.JSONDecodeError):
+            pass
+    return ""
+
+
+def _search_response_matches(response, expected_query: str) -> bool:
+    if "SearchTimeline" not in response.url or response.status not in {200, 429}:
+        return False
+    actual = _search_raw_query(response.url, response.request.post_data)
+    return " ".join(actual.split()) == " ".join(expected_query.split())
+
+
+def _response_headers(response) -> dict[str, str]:
+    return {
+        name: response.header_value(name) or ""
+        for name in ("retry-after", "x-rate-limit-limit", "x-rate-limit-reset", "x-rate-limit-remaining")
+    }
+
+
+def _search_template(response) -> dict[str, object]:
+    request = response.request
+    forwarded = {
+        "authorization", "content-type", "x-csrf-token", "x-twitter-active-user",
+        "x-twitter-auth-type", "x-twitter-client-language",
+    }
+    return {
+        "url": response.url,
+        "method": request.method,
+        "headers": {key: value for key, value in request.all_headers().items() if key.lower() in forwarded},
+        "body": request.post_data,
+    }
+
+
+def _graphql_operation(url: str) -> tuple[str, str]:
+    """Return audit-safe endpoint metadata without cookies or authorization."""
+    path = urlsplit(url).path
+    operation = path.rstrip("/").split("/")[-1] if path else ""
+    return operation, path
+
+
+def _replay_search(page, template: dict[str, object], cursor: str) -> tuple[dict[str, object], dict[str, str]]:
+    url = _search_url_with_cursor(str(template["url"]), cursor)
+    replay = page.evaluate(
+        """async ({url, method, headers, body}) => {
+            const response = await fetch(url, {
+                method, headers, body: method === 'GET' ? undefined : body,
+                credentials: 'include'
+            });
+            let payload = {};
+            try { payload = await response.json(); } catch (_) {}
+            return {status: response.status, ok: response.ok, payload, headers: {
+                'retry-after': response.headers.get('retry-after') || '',
+                'x-rate-limit-limit': response.headers.get('x-rate-limit-limit') || '',
+                'x-rate-limit-reset': response.headers.get('x-rate-limit-reset') || '',
+                'x-rate-limit-remaining': response.headers.get('x-rate-limit-remaining') || ''
+            }};
+        }""",
+        {"url": url, "method": template["method"], "headers": template["headers"], "body": template.get("body")},
+    )
+    status = int(replay.get("status", 0))
+    headers = replay.get("headers", {}) if isinstance(replay.get("headers"), dict) else {}
+    if status == 429:
+        raise SearchRateLimitError(_retry_after_seconds(headers))
+    if status in {401, 403}:
+        raise RuntimeError(f"SearchTimeline HTTP {status}；登录会话可能失效")
+    if not replay.get("ok"):
+        raise RuntimeError(f"SearchTimeline HTTP {status or 'unknown'}")
+    payload = replay.get("payload", {})
+    if not isinstance(payload, dict):
+        raise RuntimeError("SearchTimeline 未返回 JSON")
+    return payload, headers
+
+
+def _next_browser_signed_search_response(page, query: str, attempts: int = 3, timeout_ms: int = 15_000):
+    """Let X create a fresh transaction id, retrying the physical pagination trigger when the UI stalls."""
+    for attempt in range(1, attempts + 1):
+        try:
+            with page.expect_response(
+                lambda response: _search_response_matches(response, query),
+                timeout=timeout_ms,
+            ) as pending:
+                # X virtualizes its timeline, so use increasingly strong UI gestures.
+                # The request remains created by X itself (including its one-use
+                # transaction id); we only retrigger the visible pagination sentinel.
+                if attempt == 1:
+                    page.mouse.wheel(0, 3200)
+                    page.keyboard.press("End")
+                elif attempt == 2:
+                    page.mouse.wheel(0, -900)
+                    page.wait_for_timeout(500)
+                    page.mouse.wheel(0, 5200)
+                    page.keyboard.press("End")
+                else:
+                    tweets = page.locator("article[data-testid='tweet']")
+                    if tweets.count():
+                        tweets.last.scroll_into_view_if_needed(timeout=5_000)
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    page.keyboard.press("End")
+            return pending.value, attempt
+        except PlaywrightTimeoutError:
+            if attempt < attempts:
+                page.wait_for_timeout(700 + attempt * 500)
+    return None, attempts
+
+
+def collect_search_graphql(page, keyword: str, keyword_index: int, limit: int, max_pages: int, output_dir: Path, start_date: date | None = None, end_date: date | None = None, search_type: str = "live", no_growth_stop: int = 5, request_delay_min: float = 2, request_delay_max: float = 4, timezone_offset: float = 8, pagination_trigger_attempts: int = 3, pagination_trigger_timeout_ms: int = 15_000) -> tuple[list[dict[str, object]], dict[str, object]]:
+    query = build_search_query(keyword, start_date, end_date)
+    suffix = "&f=live" if search_type == "live" else ""
+    url = f"https://x.com/search?q={quote(query)}&src=typed_query{suffix}"
+    try:
+        with page.expect_response(lambda r: _search_response_matches(r, query), timeout=90_000) as pending:
+            page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+        response = pending.value
+    except PlaywrightTimeoutError as exc:
+        raise RuntimeError("未捕获到 SearchTimeline JSON 响应") from exc
+    if response.status == 429:
+        raise SearchRateLimitError(_retry_after_seconds(_response_headers(response)))
+    first_payload = response.json()
+    if not isinstance(first_payload, dict):
+        raise RuntimeError("SearchTimeline 首次响应不是 JSON 对象")
+    template = _search_template(response)
+    operation_name, endpoint_path = _graphql_operation(str(template["url"]))
+    rows: list[dict[str, object]] = []
+    seen: set[str] = set()
+    seen_cursors: set[str] = set()
+    payload = first_payload
+    stop_reason = "max_pages"
+    pages_used = 0
+    no_growth = 0
+    rate_limit: dict[str, float] = _rate_limit_state(_response_headers(response))
+    pagination_trigger_retries = 0
+    last_cursor = ""
+    target_label = str(limit) if limit > 0 else "不限"
+
+    for page_index in range(max_pages):
+        pages_used = page_index + 1
+        parsed, cursor = parse_search_timeline(payload, keyword, keyword_index)
+        added = 0
+        for row in parsed:
+            if not post_in_date_range(str(row.get("posted_at", "")), start_date, end_date, timezone_offset):
+                continue
+            post_id = str(row.get("post_id", ""))
+            if not post_id or post_id in seen:
+                continue
+            seen.add(post_id)
+            row["rank"] = len(rows) + 1
+            rows.append(row)
+            added += 1
+            if limit > 0 and len(rows) >= limit:
+                break
+        print(f"  JSON页 {pages_used}/{max_pages}：新增 {added}，累计 {len(rows)}/{target_label}", flush=True)
+        if limit > 0 and len(rows) >= limit:
+            stop_reason = "target_reached"
+            break
+        no_growth = no_growth + 1 if added == 0 else 0
+        if no_growth >= no_growth_stop:
+            stop_reason = "no_new_results"
+            break
+        if not cursor:
+            stop_reason = "cursor_exhausted"
+            break
+        if cursor in seen_cursors:
+            stop_reason = "repeated_cursor"
+            break
+        seen_cursors.add(cursor)
+        last_cursor = cursor
+        remaining = rate_limit.get("remaining")
+        reset = rate_limit.get("reset")
+        if isinstance(remaining, (int, float)) and remaining <= 5 and isinstance(reset, (int, float)) and reset > time.time():
+            pause = max(5.0, reset - time.time()) + random.uniform(5, 20)
+            print(f"  [搜索响应头节奏] 当前额度剩余 {int(remaining)}，按 reset 暂停 {pause / 60:.1f} 分钟。", flush=True)
+            time.sleep(pause)
+        else:
+            time.sleep(random.uniform(request_delay_min, request_delay_max))
+        next_response, trigger_attempt = _next_browser_signed_search_response(
+            page, query, pagination_trigger_attempts, pagination_trigger_timeout_ms,
+        )
+        pagination_trigger_retries += max(0, trigger_attempt - 1)
+        if next_response is None:
+            stop_reason = "pagination_not_triggered"
+            print(
+                f"  [分页触发失败] 已按当前查询重试 {pagination_trigger_attempts} 次，"
+                "不是断网判定；已保存当前帖子与游标，稍后进入修复队列。",
+                flush=True,
+            )
+            break
+        if next_response.status == 429:
+            raise SearchRateLimitError(_retry_after_seconds(_response_headers(next_response)))
+        payload = next_response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("SearchTimeline 翻页响应不是 JSON 对象")
+        rate_limit = _rate_limit_state(_response_headers(next_response))
+
+    selected = rows[:limit] if limit > 0 else rows
+    coverage = {
+        "query": query,
+        "slice_start": start_date.isoformat() if start_date else "",
+        "slice_end": end_date.isoformat() if end_date else "",
+        "count": len(selected),
+        "scrolls_used": 0,
+        "json_pages_used": pages_used,
+        "pagination_trigger_retries": pagination_trigger_retries,
+        "last_cursor": last_cursor,
+        "stop_reason": stop_reason,
+        "coverage_status": (
+            "needs_retry"
+            if stop_reason in RETRYABLE_SEARCH_STOP_REASONS
+            else "apparently_exhausted"
+            if stop_reason in {"cursor_exhausted", "no_new_results", "repeated_cursor"}
+            else "truncated"
+        ),
+        "date_timezone": f"UTC{timezone_offset:+g}",
+        "search_engine": "graphql",
+        "request_transport": "browser_signed_network_json",
+        "request_method": str(template.get("method", "GET")),
+        "operation_name": operation_name,
+        "endpoint_path": endpoint_path,
+        "rate_limit_limit": rate_limit.get("limit", ""),
+        "rate_limit_remaining": rate_limit.get("remaining", ""),
+        "rate_limit_reset": rate_limit.get("reset", ""),
+    }
+    return selected, coverage
+
+
 def _direct_about_url(url: str, username: str) -> str:
     parts = urlsplit(url)
     query = parse_qs(parts.query, keep_blank_values=True)
@@ -557,6 +1092,126 @@ def _author_from_about(username: str, payload: dict[str, object]) -> dict[str, o
     }
 
 
+def _direct_profile_url(url: str, username: str, user_id: str = "") -> str:
+    parts = urlsplit(url)
+    query = parse_qs(parts.query, keep_blank_values=True)
+    values = query.get("variables")
+    if not values:
+        raise RuntimeError("用户资料请求中没有 variables")
+    variables = json.loads(values[0])
+    if not isinstance(variables, dict):
+        raise RuntimeError("用户资料 variables 格式无效")
+    changed = False
+    for key in ("screen_name", "screenName", "username"):
+        if key in variables:
+            variables[key] = username
+            changed = True
+    for key in ("userId", "user_id", "rest_id"):
+        if key in variables and user_id:
+            variables[key] = user_id
+            changed = True
+    if not changed:
+        raise RuntimeError("用户资料请求中未找到可替换的用户名或用户 ID")
+    query["variables"] = [json.dumps(variables, separators=(",", ":"), ensure_ascii=False)]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query, doseq=True), parts.fragment))
+
+
+def _profile_author_from_payload(username: str, payload: dict[str, object]) -> dict[str, object]:
+    result = _nested_dict(payload, "data", "user", "result")
+    if not result:
+        raise RuntimeError("UserByScreenName 未返回用户结果")
+    if str(result.get("__typename", "")) == "UserUnavailable":
+        raise RuntimeError("用户不可用、受限或已停用")
+    core = result.get("core") if isinstance(result.get("core"), dict) else {}
+    legacy = result.get("legacy") if isinstance(result.get("legacy"), dict) else {}
+    location_node = result.get("location") if isinstance(result.get("location"), dict) else {}
+    location = str(location_node.get("location") or legacy.get("location") or "").strip()
+    return {
+        "username": str(core.get("screen_name") or legacy.get("screen_name") or username),
+        "user_id": str(result.get("rest_id") or legacy.get("id_str") or ""),
+        "profile_location": location,
+        "profile_location_status": "success" if location else "empty",
+        "profile_location_error": "",
+        "profile_location_collected_at": now_iso(),
+    }
+
+
+def lookup_profile_location_direct(page, username: str, user_id: str, template: dict[str, object]) -> dict[str, object]:
+    url = _direct_profile_url(str(template["url"]), username, user_id)
+    replay = page.evaluate(
+        """async ({url, method, headers, body}) => {
+            const response = await fetch(url, {
+                method, headers, body: method === 'GET' ? undefined : body,
+                credentials: 'include'
+            });
+            let payload = {};
+            try { payload = await response.json(); } catch (_) {}
+            return {status: response.status, ok: response.ok, payload, headers: {
+                'retry-after': response.headers.get('retry-after') || '',
+                'x-rate-limit-limit': response.headers.get('x-rate-limit-limit') || '',
+                'x-rate-limit-reset': response.headers.get('x-rate-limit-reset') || '',
+                'x-rate-limit-remaining': response.headers.get('x-rate-limit-remaining') || ''
+            }};
+        }""",
+        {"url": url, "method": template["method"], "headers": template["headers"], "body": template.get("body")},
+    )
+    status = int(replay.get("status", 0))
+    headers = replay.get("headers", {}) if isinstance(replay.get("headers"), dict) else {}
+    if status == 429:
+        raise RateLimitError(429, _retry_after_seconds(headers), "UserByScreenName")
+    if status in {401, 403}:
+        raise RuntimeError(f"UserByScreenName HTTP {status}")
+    if not replay.get("ok"):
+        raise RuntimeError(f"UserByScreenName HTTP {status or 'unknown'}")
+    payload = replay.get("payload", {})
+    if not isinstance(payload, dict):
+        raise RuntimeError("UserByScreenName 未返回 JSON")
+    author = _profile_author_from_payload(username, payload)
+    author["_rate_limit"] = _rate_limit_state(headers)
+    return author
+
+
+def lookup_profile_location(page, username: str, user_id: str, render_wait_ms: int, direct_state: dict[str, object]) -> dict[str, object]:
+    if isinstance(direct_state.get("template"), dict):
+        try:
+            return lookup_profile_location_direct(page, username, user_id, direct_state["template"])
+        except RuntimeError as exc:
+            if any(marker in str(exc) for marker in ("HTTP 401", "HTTP 403", "HTTP 429")):
+                raise
+            direct_state.pop("template", None)
+            print(f"  用户资料直接请求模板失效，重新从页面捕获：{exc}", flush=True)
+    try:
+        with page.expect_response(
+            lambda response: "UserByScreenName" in response.url and response.status in {200, 429},
+            timeout=60_000,
+        ) as pending:
+            page.goto(f"https://x.com/{username}", wait_until="domcontentloaded", timeout=90_000)
+        response = pending.value
+    except PlaywrightTimeoutError as exc:
+        raise RuntimeError("未捕获到 UserByScreenName JSON；登录可能失效或账号不可用") from exc
+    headers = _response_headers(response)
+    if response.status == 429:
+        raise RateLimitError(429, _retry_after_seconds(headers), "UserByScreenName")
+    payload = response.json()
+    request = response.request
+    forwarded = {
+        "authorization", "content-type", "x-csrf-token", "x-twitter-active-user",
+        "x-twitter-auth-type", "x-twitter-client-language",
+    }
+    direct_state["template"] = {
+        "url": response.url,
+        "method": request.method,
+        "headers": {key: value for key, value in request.all_headers().items() if key.lower() in forwarded},
+        "body": request.post_data,
+    }
+    print("  已捕获真实 UserByScreenName；后续作者改用资料 JSON 直接请求。", flush=True)
+    author = _profile_author_from_payload(username, payload)
+    author["_rate_limit"] = _rate_limit_state(headers)
+    if render_wait_ms > 0:
+        page.wait_for_timeout(min(render_wait_ms, 1000))
+    return author
+
+
 def lookup_author_direct(page, username: str, template: dict[str, object]) -> dict[str, object]:
     url = _direct_about_url(str(template["url"]), username)
     replay = page.evaluate(
@@ -569,6 +1224,7 @@ def lookup_author_direct(page, username: str, template: dict[str, object]) -> di
             try { payload = await response.json(); } catch (_) {}
             return {status: response.status, ok: response.ok, payload, headers: {
                 'retry-after': response.headers.get('retry-after') || '',
+                'x-rate-limit-limit': response.headers.get('x-rate-limit-limit') || '',
                 'x-rate-limit-reset': response.headers.get('x-rate-limit-reset') || '',
                 'x-rate-limit-remaining': response.headers.get('x-rate-limit-remaining') || ''
             }};
@@ -586,7 +1242,11 @@ def lookup_author_direct(page, username: str, template: dict[str, object]) -> di
     payload = replay.get("payload", {})
     if not isinstance(payload, dict):
         raise RuntimeError("AboutAccountQuery 未返回 JSON")
-    return _author_from_about(username, payload)
+    author = _author_from_about(username, payload)
+    headers = replay.get("headers", {})
+    if isinstance(headers, dict):
+        author["_rate_limit"] = _rate_limit_state(headers)
+    return author
 
 
 def lookup_author(page, username: str, render_wait_ms: int, direct_state: dict[str, object] | None = None) -> dict[str, object]:
@@ -614,7 +1274,7 @@ def lookup_author(page, username: str, render_wait_ms: int, direct_state: dict[s
             page.goto(f"https://x.com/{username}/about", wait_until="domcontentloaded", timeout=90_000)
         response = pending.value
     if response.status == 429:
-        headers = {name: response.header_value(name) or "" for name in ("retry-after", "x-rate-limit-reset", "x-rate-limit-remaining")}
+        headers = {name: response.header_value(name) or "" for name in ("retry-after", "x-rate-limit-limit", "x-rate-limit-reset", "x-rate-limit-remaining")}
         raise RateLimitError(429, _retry_after_seconds(headers))
     if response.status in {401, 403}:
         raise RuntimeError(f"AboutAccountQuery HTTP {response.status}")
@@ -632,7 +1292,10 @@ def lookup_author(page, username: str, render_wait_ms: int, direct_state: dict[s
             "body": request.post_data,
         }
         print("  已捕获真实 AboutAccountQuery；后续作者改用直接请求。", flush=True)
-    return _author_from_about(username, payload)
+    author = _author_from_about(username, payload)
+    headers = {name: response.header_value(name) or "" for name in ("x-rate-limit-limit", "x-rate-limit-reset", "x-rate-limit-remaining")}
+    author["_rate_limit"] = _rate_limit_state(headers)
+    return author
 
 
 def enrich_posts(posts: list[dict[str, object]], author: dict[str, object]) -> None:
@@ -640,7 +1303,11 @@ def enrich_posts(posts: list[dict[str, object]], author: dict[str, object]) -> N
     for post in posts:
         if str(post.get("author_username", "")).casefold() != username:
             continue
-        post["author_user_id"] = author.get("user_id", "")
+        if author.get("user_id"):
+            post["author_user_id"] = author["user_id"]
+        if author.get("profile_location") and not post.get("profile_location"):
+            post["profile_location"] = author["profile_location"]
+            post["profile_location_collected_at"] = author.get("profile_location_collected_at", "")
         post["account_based_in"] = author.get("account_based_in", "")
         post["account_lookup_status"] = author.get("status", "failed")
 
@@ -681,6 +1348,112 @@ def apply_author_cache(posts: list[dict[str, object]], authors: dict[str, dict[s
     return applied
 
 
+def register_pending_authors(posts: list[dict[str, object]], authors: dict[str, dict[str, object]]) -> int:
+    """Persist a durable backfill queue before Account based in is requested."""
+    added = 0
+    for post in posts:
+        username = str(post.get("author_username", "") or "").strip()
+        if not username:
+            continue
+        key = username.casefold()
+        current = authors.get(key)
+        if not isinstance(current, dict):
+            profile_location = str(post.get("profile_location", "") or "")
+            current = {
+                "username": username,
+                "user_id": str(post.get("author_user_id", "") or ""),
+                "profile_location": profile_location,
+                "profile_location_status": "success" if profile_location else "pending",
+                "profile_location_error": "",
+                "profile_location_collected_at": str(post.get("profile_location_collected_at", "") or ""),
+                "account_based_in": "",
+                "status": "pending",
+                "error": "",
+                "collected_at": "",
+            }
+            authors[key] = current
+            added += 1
+        else:
+            if not current.get("user_id") and post.get("author_user_id"):
+                current["user_id"] = post["author_user_id"]
+            if not current.get("profile_location") and post.get("profile_location"):
+                current["profile_location"] = post["profile_location"]
+                current["profile_location_status"] = "success"
+                current["profile_location_error"] = ""
+                current["profile_location_collected_at"] = post.get("profile_location_collected_at", "")
+            elif current.get("profile_location") and not current.get("profile_location_status"):
+                current["profile_location_status"] = "success"
+    return added
+
+
+def enrich_profile_location_posts(posts: list[dict[str, object]], author: dict[str, object]) -> None:
+    """Apply only the public self-declared profile location; never touch Account based in."""
+    username = str(author.get("username", "")).casefold()
+    for post in posts:
+        if str(post.get("author_username", "")).casefold() != username:
+            continue
+        if author.get("user_id"):
+            post["author_user_id"] = author["user_id"]
+        post["profile_location"] = author.get("profile_location", "")
+        post["profile_location_status"] = author.get("profile_location_status", "empty")
+        post["profile_location_error"] = author.get("profile_location_error", "")
+        post["profile_location_collected_at"] = author.get("profile_location_collected_at", "")
+
+
+def load_profile_location_cache(output_dir: Path) -> dict[str, dict[str, object]]:
+    """Reuse completed UserByScreenName lookups across runs, including confirmed empty values."""
+    cache: dict[str, dict[str, object]] = {}
+    parent = output_dir.parent
+    if not parent.exists():
+        return cache
+    for directory in sorted((path for path in parent.iterdir() if path.is_dir() and path != output_dir)):
+        raw_path = directory / "raw.json"
+        if not raw_path.exists():
+            continue
+        try:
+            raw = json.loads(raw_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        previous = raw.get("authors", {}) if isinstance(raw, dict) else {}
+        if not isinstance(previous, dict):
+            continue
+        for key, author in previous.items():
+            if not isinstance(author, dict):
+                continue
+            status = str(author.get("profile_location_status", "") or "")
+            if author.get("profile_location"):
+                status = "success"
+            if status not in {"success", "empty"}:
+                continue
+            cache[str(key).casefold()] = {
+                "username": author.get("username", key),
+                "user_id": author.get("user_id", ""),
+                "profile_location": author.get("profile_location", ""),
+                "profile_location_status": status,
+                "profile_location_error": "",
+                "profile_location_collected_at": author.get("profile_location_collected_at", ""),
+            }
+    return cache
+
+
+def apply_profile_location_cache(posts: list[dict[str, object]], authors: dict[str, dict[str, object]], cache: dict[str, dict[str, object]]) -> int:
+    applied = 0
+    for key, current in authors.items():
+        cache_key = str(key).casefold()
+        if not isinstance(current, dict) or not profile_location_needs_lookup(current) or cache_key not in cache:
+            continue
+        cached = cache[cache_key]
+        for field in (
+            "user_id", "profile_location", "profile_location_status",
+            "profile_location_error", "profile_location_collected_at",
+        ):
+            if cached.get(field) or field in {"profile_location", "profile_location_error"}:
+                current[field] = cached.get(field, "")
+        enrich_profile_location_posts(posts, current)
+        applied += 1
+    return applied
+
+
 def enrich_author_batch(page, args: argparse.Namespace, output_dir: Path, payload: dict[str, object], posts: list[dict[str, object]], authors: dict[str, dict[str, object]], usernames: list[str], label: str, direct_state: dict[str, object]) -> int:
     pending = [
         name for name in dict.fromkeys(name for name in usernames if name)
@@ -691,9 +1464,26 @@ def enrich_author_batch(page, args: argparse.Namespace, output_dir: Path, payloa
     print(f"\n[{label}] 需要查询所在地的去重作者：{len(pending)} 个。", flush=True)
     for index, username in enumerate(pending, 1):
         if index > 1 and args.author_break_every > 0 and (index - 1) % args.author_break_every == 0:
-            pause = random.uniform(args.author_break_min, args.author_break_max)
-            print(f"[作者定期休息] 已处理 {index - 1} 位，暂停 {pause / 60:.1f} 分钟。", flush=True)
-            time.sleep(pause)
+            refreshed_cache = load_author_cache(output_dir)
+            reused = apply_author_cache(posts, authors, refreshed_cache)
+            if reused:
+                print(f"[跨任务缓存] 新复用 {reused} 位作者所在地，避免重复请求。", flush=True)
+            save_outputs(output_dir, payload)
+            remaining = direct_state.get("rate_limit_remaining")
+            reset = direct_state.get("rate_limit_reset")
+            guard = max(5, args.author_break_every + 2)
+            if isinstance(remaining, (int, float)) and remaining > guard:
+                print(f"[响应头节奏] 当前额度剩余 {int(remaining)}，跳过固定长休息。", flush=True)
+            elif isinstance(remaining, (int, float)) and isinstance(reset, (int, float)) and reset > time.time():
+                pause = max(5.0, reset - time.time()) + random.uniform(5, 20)
+                print(f"[响应头节奏] 当前额度剩余 {int(remaining)}，按 reset 暂停 {pause / 60:.1f} 分钟。", flush=True)
+                time.sleep(pause)
+            else:
+                pause = random.uniform(args.author_break_min, args.author_break_max)
+                print(f"[作者定期休息] 未获得可靠额度响应头；已处理 {index - 1} 位，暂停 {pause / 60:.1f} 分钟。", flush=True)
+                time.sleep(pause)
+        if authors.get(username.casefold(), {}).get("status") in {"success", "unknown"}:
+            continue
         if index > 1:
             if direct_state.get("template"):
                 time.sleep(random.uniform(args.direct_author_delay_min, args.direct_author_delay_max))
@@ -705,6 +1495,12 @@ def enrich_author_batch(page, args: argparse.Namespace, output_dir: Path, payloa
             wait_for_shared_about_cooldown(payload, output_dir)
             try:
                 author = lookup_author(page, username, args.render_wait_ms, direct_state)
+                rate_limit = author.pop("_rate_limit", {})
+                if isinstance(rate_limit, dict):
+                    if "remaining" in rate_limit:
+                        direct_state["rate_limit_remaining"] = rate_limit["remaining"]
+                    if "reset" in rate_limit:
+                        direct_state["rate_limit_reset"] = rate_limit["reset"]
                 print(f"  所在地：{author['account_based_in'] or 'X 未公开'}", flush=True)
                 break
             except RateLimitError as exc:
@@ -728,14 +1524,162 @@ def enrich_author_batch(page, args: argparse.Namespace, output_dir: Path, payloa
                 break
         if author is None:
             raise RuntimeError("作者查询未产生结果")
+        existing_author = authors.get(username.casefold(), {})
+        if isinstance(existing_author, dict):
+            if not author.get("user_id") and existing_author.get("user_id"):
+                author["user_id"] = existing_author["user_id"]
+            for field in ("profile_location", "profile_location_collected_at"):
+                if existing_author.get(field):
+                    author[field] = existing_author[field]
         authors[username.casefold()] = author
         enrich_posts(posts, author)
-        save_outputs(output_dir, payload)
+        save_checkpoint(output_dir, payload)
         if any(marker in str(author.get("error", "")) for marker in ("HTTP 401", "HTTP 403", "HTTP 429")):
             raise RuntimeError(str(author["error"]))
     payload["active_phase"] = "searching"
     save_outputs(output_dir, payload)
     return len(pending)
+
+
+def enrich_profile_location_batch(
+    page,
+    args: argparse.Namespace,
+    output_dir: Path,
+    payload: dict[str, object],
+    posts: list[dict[str, object]],
+    authors: dict[str, dict[str, object]],
+) -> int:
+    """Backfill self-declared profile locations through observed UserByScreenName JSON."""
+    pending = [
+        str(author.get("username", key))
+        for key, author in authors.items()
+        if isinstance(author, dict) and profile_location_needs_lookup(author)
+    ]
+    payload["active_phase"] = "profile_location_enriching"
+    save_outputs(output_dir, payload)
+    print(f"\n[快速补自填位置] 待查询去重作者：{len(pending)} 个。", flush=True)
+    direct_state: dict[str, object] = {}
+    processed = 0
+    for index, username in enumerate(pending, 1):
+        key = username.casefold()
+        current = authors.get(key, {})
+        if not isinstance(current, dict) or not profile_location_needs_lookup(current):
+            continue
+        if index > 1:
+            remaining = direct_state.get("rate_limit_remaining")
+            reset = direct_state.get("rate_limit_reset")
+            if isinstance(remaining, (int, float)) and remaining <= 2 and isinstance(reset, (int, float)) and reset > time.time():
+                pause = max(5.0, reset - time.time()) + random.uniform(5, 20)
+                print(f"[资料响应头节奏] 额度剩余 {int(remaining)}，等待 {pause / 60:.1f} 分钟。", flush=True)
+                time.sleep(pause)
+            else:
+                time.sleep(random.uniform(args.profile_delay_min, args.profile_delay_max))
+        print(f"[自填位置 {index}/{len(pending)}] @{username}", flush=True)
+        result: dict[str, object] | None = None
+        fatal_error = False
+        for attempt in range(args.author_429_retries + 1):
+            try:
+                result = lookup_profile_location(
+                    page,
+                    username,
+                    str(current.get("user_id", "") or ""),
+                    args.render_wait_ms,
+                    direct_state,
+                )
+                rate_limit = result.pop("_rate_limit", {})
+                if isinstance(rate_limit, dict):
+                    if "remaining" in rate_limit:
+                        direct_state["rate_limit_remaining"] = rate_limit["remaining"]
+                    if "reset" in rate_limit:
+                        direct_state["rate_limit_reset"] = rate_limit["reset"]
+                print(f"  自填位置：{result.get('profile_location') or '未填写'}", flush=True)
+                break
+            except RateLimitError as exc:
+                if attempt >= args.author_429_retries:
+                    message = f"{type(exc).__name__}: {exc}；自动冷却重试已耗尽"
+                    result = {
+                        "username": username, "user_id": current.get("user_id", ""),
+                        "profile_location": "", "profile_location_status": "failed",
+                        "profile_location_error": message, "profile_location_collected_at": now_iso(),
+                    }
+                    fatal_error = True
+                    print(f"  查询失败：{message}", flush=True)
+                    break
+                fallback = min(args.author_429_max_cooldown, args.author_429_base_cooldown * (2 ** attempt))
+                cooldown = max(exc.retry_after or 0, fallback) + random.uniform(15, 90)
+                direct_state.pop("template", None)
+                payload["active_phase"] = "profile_location_rate_limited"
+                payload["cooldown_until"] = datetime.fromtimestamp(time.time() + cooldown).astimezone().isoformat(timespec="seconds")
+                save_outputs(output_dir, payload)
+                print(f"  UserByScreenName 触发 429；按响应头/退避等待 {cooldown / 60:.1f} 分钟。", flush=True)
+                time.sleep(cooldown)
+                payload.pop("cooldown_until", None)
+                payload["active_phase"] = "profile_location_enriching"
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                result = {
+                    "username": username, "user_id": current.get("user_id", ""),
+                    "profile_location": "", "profile_location_status": "failed",
+                    "profile_location_error": message, "profile_location_collected_at": now_iso(),
+                }
+                fatal_error = any(marker in message for marker in ("HTTP 401", "HTTP 403", "登录可能失效"))
+                print(f"  查询失败：{message}", flush=True)
+                break
+        if result is None:
+            raise RuntimeError("自填位置查询未产生结果")
+        if not result.get("user_id") and current.get("user_id"):
+            result["user_id"] = current["user_id"]
+        for field, value in result.items():
+            if not str(field).startswith("_"):
+                current[field] = value
+        authors[key] = current
+        enrich_profile_location_posts(posts, current)
+        processed += 1
+        if processed % args.profile_checkpoint_every == 0 or fatal_error:
+            save_checkpoint(output_dir, payload)
+        if fatal_error:
+            raise RuntimeError(str(result.get("profile_location_error", "自填位置查询失败")))
+    payload.pop("cooldown_until", None)
+    payload["profile_location_backlog_count"] = len(profile_location_queue(authors))
+    payload["active_phase"] = "completed_with_author_backlog" if any(
+        isinstance(author, dict) and author.get("status") in {"pending", "failed"}
+        for author in authors.values()
+    ) else "completed"
+    save_outputs(output_dir, payload)
+    return processed
+
+
+def collect_profile_locations(args: argparse.Namespace, output_dir: Path) -> None:
+    raw_path = output_dir / "raw.json"
+    if not raw_path.exists():
+        raise RuntimeError("找不到 raw.json，无法补全自填位置")
+    payload = json.loads(raw_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("raw.json 格式无效")
+    posts = [post for post in payload.get("posts", []) if isinstance(post, dict)]
+    authors = payload.get("authors", {})
+    authors = dict(authors) if isinstance(authors, dict) else {}
+    payload["posts"], payload["authors"] = posts, authors
+    register_pending_authors(posts, authors)
+    cached = apply_profile_location_cache(posts, authors, load_profile_location_cache(output_dir))
+    if cached:
+        print(f"[跨任务缓存] 已复用 {cached} 位作者的自填位置结果。", flush=True)
+    queue = profile_location_queue(authors)
+    if not queue:
+        print("没有待补的自填位置作者。", flush=True)
+        save_outputs(output_dir, payload)
+        return
+    print("模式：仅快速补全 profile_location；不会搜索帖子，也不会请求 Account based in。", flush=True)
+    with sync_playwright() as pw:
+        context = pw.chromium.launch_persistent_context(
+            str(args.session_dir.resolve()), headless=False, executable_path=str(CHROME),
+            locale="en-US", viewport={"width": 1400, "height": 1000},
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        wait_for_login(context, page, args.login_timeout)
+        enrich_profile_location_batch(page, args, output_dir, payload, posts, authors)
+        context.close()
 
 
 def collect(args: argparse.Namespace, keywords: list[str], output_dir: Path) -> None:
@@ -751,11 +1695,16 @@ def collect(args: argparse.Namespace, keywords: list[str], output_dir: Path) -> 
     payload["search_conditions"] = {
         "start_date": args.start_date or "", "end_date": args.end_date or "", "search_type": args.search_type,
         "slice_days": args.slice_days, "no_growth_stop": args.no_growth_stop, "timezone_offset": args.timezone_offset,
-        "author_strategy": args.author_strategy,
+        "author_strategy": args.author_strategy, "search_engine": args.search_engine,
     }
     posts: list[dict[str, object]] = list(payload.get("posts", []))
     authors: dict[str, dict[str, object]] = dict(payload.get("authors", {}))
     payload["posts"], payload["authors"] = posts, authors
+    register_pending_authors(posts, authors)
+    profile_cache = load_profile_location_cache(output_dir)
+    profile_cached_count = apply_profile_location_cache(posts, authors, profile_cache)
+    if profile_cached_count:
+        print(f"已复用历史批次作者自填位置：{profile_cached_count} 位。", flush=True)
     author_cache = load_author_cache(output_dir)
     cached_count = apply_author_cache(posts, authors, author_cache)
     if cached_count:
@@ -764,10 +1713,7 @@ def collect(args: argparse.Namespace, keywords: list[str], output_dir: Path) -> 
 
     slices = make_date_slices(start_date, end_date, args.slice_days)
     work_items = [(keyword_index, keyword, slice_start, slice_end) for keyword_index, keyword in enumerate(keywords, 1) for slice_start, slice_end in slices]
-    completed = {
-        (str(run.get("keyword", "")), str(run.get("slice_start", "")), str(run.get("slice_end", "")))
-        for run in payload.get("search_runs", [])
-    }
+    completed = reliable_search_keys(payload.get("search_runs", []))
     with sync_playwright() as pw:
         context = pw.chromium.launch_persistent_context(
             str(args.session_dir.resolve()), headless=False, executable_path=str(CHROME),
@@ -798,10 +1744,25 @@ def collect(args: argparse.Namespace, keywords: list[str], output_dir: Path) -> 
             print(f"\n[搜索片 {task_index}/{len(work_items)}] {keyword}{period}", flush=True)
             payload["active_phase"] = "searching"
             save_outputs(output_dir, payload)
+            search_started_at = now_iso()
+            search_started_monotonic = time.monotonic()
             last_error: Exception | None = None
             for attempt in range(args.retry_limit + 1):
                 try:
-                    rows, coverage = collect_search(page, keyword, keyword_index, args.limit, args.max_scrolls, args.render_wait_ms, output_dir, slice_start, slice_end, args.search_type, args.no_growth_stop, args.scroll_delay_min, args.scroll_delay_max, args.timezone_offset)
+                    if args.search_engine == "scroll":
+                        rows, coverage = collect_search(page, keyword, keyword_index, args.limit, args.max_scrolls, args.render_wait_ms, output_dir, slice_start, slice_end, args.search_type, args.no_growth_stop, args.scroll_delay_min, args.scroll_delay_max, args.timezone_offset)
+                        coverage["search_engine"] = "scroll"
+                    else:
+                        try:
+                            rows, coverage = collect_search_graphql(page, keyword, keyword_index, args.limit, args.max_scrolls, output_dir, slice_start, slice_end, args.search_type, args.no_growth_stop, args.graphql_delay_min, args.graphql_delay_max, args.timezone_offset, args.pagination_trigger_attempts, args.pagination_trigger_timeout_ms)
+                        except SearchRateLimitError:
+                            raise
+                        except Exception as exc:
+                            if args.search_engine != "auto":
+                                raise
+                            print(f"  [高速模式回退] {type(exc).__name__}: {exc}；本片改用页面滚动。", flush=True)
+                            rows, coverage = collect_search(page, keyword, keyword_index, args.limit, args.max_scrolls, args.render_wait_ms, output_dir, slice_start, slice_end, args.search_type, args.no_growth_stop, args.scroll_delay_min, args.scroll_delay_max, args.timezone_offset)
+                            coverage["search_engine"] = "scroll_fallback"
                     last_error = None
                     break
                 except Exception as exc:
@@ -812,15 +1773,27 @@ def collect(args: argparse.Namespace, keywords: list[str], output_dir: Path) -> 
                     if "429" in str(exc) or "限流" in str(exc):
                         factor *= 2
                     pause = random.uniform(args.backoff_min, args.backoff_max) * factor
+                    if isinstance(exc, SearchRateLimitError) and exc.retry_after:
+                        pause = max(pause, exc.retry_after + random.uniform(10, 45))
                     print(f"[退避重试 {attempt + 1}/{args.retry_limit}] {type(exc).__name__}: {exc}；暂停 {pause / 60:.1f} 分钟。", flush=True)
                     time.sleep(pause)
             if last_error is not None:
                 raise last_error
+            elapsed_seconds = max(0.001, time.monotonic() - search_started_monotonic)
+            coverage["started_at"] = search_started_at
+            coverage["elapsed_seconds"] = round(elapsed_seconds, 3)
+            coverage["posts_per_minute"] = round(len(rows) * 60 / elapsed_seconds, 2)
             existing_keys = {(str(p.get("keyword", "")), str(p.get("post_id", ""))) for p in posts}
             for row in rows:
                 key = (keyword, str(row.get("post_id", "")))
                 if key not in existing_keys:
                     posts.append(row); existing_keys.add(key)
+            queued = register_pending_authors(rows, authors)
+            if queued:
+                print(f"  已保存 {queued} 位新作者的稳定 ID 与所在地补全队列。", flush=True)
+            profile_cached_count = apply_profile_location_cache(posts, authors, profile_cache)
+            if profile_cached_count:
+                print(f"  复用历史批次作者自填位置：{profile_cached_count} 位。", flush=True)
             cached_count = apply_author_cache(posts, authors, author_cache)
             if cached_count:
                 print(f"  复用历史批次作者所在地：{cached_count} 位。", flush=True)
@@ -832,11 +1805,32 @@ def collect(args: argparse.Namespace, keywords: list[str], output_dir: Path) -> 
                 enrich_author_batch(page, args, output_dir, payload, posts, authors, slice_authors, f"日期片 {task_key[1]}—{task_key[2]} 作者", direct_state)
             completed_this_run += 1
 
+        repair_queue = search_repair_queue(payload.get("search_runs", []))
+        if repair_queue:
+            payload["repair_queue_count"] = len(repair_queue)
+            payload["finalized"] = False
+            payload["active_phase"] = "repair_pending"
+            print(
+                f"[异常日期队列] {len(repair_queue)} 个搜索片未收到完整网络响应；"
+                "已保留部分帖子和断点，可在工作台一键补跑。",
+                flush=True,
+            )
+            save_outputs(output_dir, payload)
+            context.close()
+            return
+
         unique_authors = list(dict.fromkeys(str(p.get("author_username", "")) for p in posts if p.get("author_username")))
-        enrich_author_batch(page, args, output_dir, payload, posts, authors, unique_authors, "任务收尾作者", direct_state)
+        if args.author_strategy != "deferred":
+            enrich_author_batch(page, args, output_dir, payload, posts, authors, unique_authors, "任务收尾作者", direct_state)
+        else:
+            pending_count = sum(1 for author in authors.values() if isinstance(author, dict) and author.get("status") == "pending")
+            payload["author_backlog_count"] = pending_count
+            print(f"[延后补全] 帖子采集已完成，{pending_count} 位作者保存在待补队列；可稍后一键补全 Account based in。", flush=True)
 
         payload["finalized"] = True
-        payload["active_phase"] = "completed"
+        payload["repair_queue_count"] = 0
+        payload["profile_location_backlog_count"] = len(profile_location_queue(authors))
+        payload["active_phase"] = "completed_with_author_backlog" if args.author_strategy == "deferred" and payload.get("author_backlog_count") else "completed"
         payload["completed_at"] = now_iso()
         save_outputs(output_dir, payload)
         context.close()
@@ -854,6 +1848,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--delay-max", type=float, default=10)
     parser.add_argument("--scroll-delay-min", type=float, default=3)
     parser.add_argument("--scroll-delay-max", type=float, default=6)
+    parser.add_argument("--search-engine", choices=["scroll", "graphql", "auto"], default="scroll", help="页面滚动、GraphQL JSON，或失败时自动回退")
+    parser.add_argument("--graphql-delay-min", type=float, default=2)
+    parser.add_argument("--graphql-delay-max", type=float, default=4)
+    parser.add_argument("--pagination-trigger-attempts", type=int, default=3, help="高速 JSON 翻页未触发时的 UI 重试次数")
+    parser.add_argument("--pagination-trigger-timeout-ms", type=int, default=15000, help="每次等待当前查询 SearchTimeline 响应的毫秒数")
     parser.add_argument("--break-every", type=int, default=20)
     parser.add_argument("--break-min", type=float, default=120)
     parser.add_argument("--break-max", type=float, default=240)
@@ -870,7 +1869,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--author-429-retries", type=int, default=3)
     parser.add_argument("--author-429-base-cooldown", type=float, default=1800)
     parser.add_argument("--author-429-max-cooldown", type=float, default=7200)
-    parser.add_argument("--author-strategy", choices=["per_slice", "after_search"], default="per_slice", help="每个日期片后查询新增作者，或全部搜索后统一查询")
+    parser.add_argument("--author-strategy", choices=["per_slice", "after_search", "deferred"], default="per_slice", help="逐片查询、搜索后查询，或保存队列稍后补全")
+    parser.add_argument("--profile-location-backfill-only", action="store_true", help="仅补全用户主页自填位置，不搜索帖子、不查询 Account based in")
+    parser.add_argument("--profile-delay-min", type=float, default=2)
+    parser.add_argument("--profile-delay-max", type=float, default=4)
+    parser.add_argument("--profile-checkpoint-every", type=int, default=20)
     parser.add_argument("--login-timeout", type=int, default=900)
     parser.add_argument("--start-date", default="")
     parser.add_argument("--end-date", default="")
@@ -888,6 +1891,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not 0 <= args.limit <= 100_000 or not 1 <= args.max_scrolls <= 10_000:
             raise ValueError("每片目标必须为 0—100000（0 表示不限），滚动次数必须为 1—10000")
+        if not 1 <= args.pagination_trigger_attempts <= 8:
+            raise ValueError("分页触发重试次数必须为 1—8")
+        if not 5_000 <= args.pagination_trigger_timeout_ms <= 60_000:
+            raise ValueError("分页响应等待必须为 5000—60000 毫秒")
         if not 0 <= args.slice_days <= 3660 or not 2 <= args.no_growth_stop <= 50:
             raise ValueError("日期切片或无新增停止次数无效")
         if not -12 <= args.timezone_offset <= 14:
@@ -896,14 +1903,19 @@ def main(argv: list[str] | None = None) -> int:
             not 0 <= args.delay_min <= args.delay_max
             or not 2 <= args.author_delay_min <= args.author_delay_max
             or not 1 <= args.direct_author_delay_min <= args.direct_author_delay_max <= 300
+            or not 0.5 <= args.profile_delay_min <= args.profile_delay_max <= 300
         ):
             raise ValueError("等待区间无效")
         if not 0 <= args.author_break_every <= 10000 or not 0 <= args.author_break_min <= args.author_break_max <= 86400:
             raise ValueError("作者定期休息参数无效")
         if not 0 <= args.author_429_retries <= 10 or not 60 <= args.author_429_base_cooldown <= args.author_429_max_cooldown <= 86400:
             raise ValueError("作者 429 冷却参数无效")
+        if not 1 <= args.profile_checkpoint_every <= 1000:
+            raise ValueError("自填位置断点频率必须为 1—1000")
         if not 1 <= args.scroll_delay_min <= args.scroll_delay_max <= 300:
             raise ValueError("滚动等待区间无效")
+        if not 0.2 <= args.graphql_delay_min <= args.graphql_delay_max <= 300:
+            raise ValueError("GraphQL 请求等待区间无效")
         if not 0 <= args.break_every <= 10000 or not 0 <= args.break_min <= args.break_max <= 86400:
             raise ValueError("定期休息参数无效")
         if not 0 <= args.retry_limit <= 10 or not 10 <= args.backoff_min <= args.backoff_max <= 86400:
@@ -915,14 +1927,23 @@ def main(argv: list[str] | None = None) -> int:
         if not keywords:
             raise ValueError("没有读取到关键词")
         print(f"关键词数：{len(keywords)}", flush=True)
-        print(f"每个搜索片目标：{args.limit if args.limit > 0 else '不限量'}", flush=True)
-        print(f"日期切片：{str(args.slice_days) + ' 天/片' if args.slice_days > 0 else '不切片'}", flush=True)
+        if args.profile_location_backfill_only:
+            print("任务类型：仅快速补全主页自填位置（不搜索帖子、不查询 Account based in）", flush=True)
+        else:
+            print(f"每个搜索片目标：{args.limit if args.limit > 0 else '不限量'}", flush=True)
+            print(f"日期切片：{str(args.slice_days) + ' 天/片' if args.slice_days > 0 else '不切片'}", flush=True)
+            print(f"搜索引擎：{args.search_engine}", flush=True)
+            print(f"Account based in：{'延后补全' if args.author_strategy == 'deferred' else '当前任务补全'}", flush=True)
         print(f"输出目录：{args.output.resolve()}", flush=True)
         if args.dry_run:
             print("DRY RUN：输入校验通过，未访问 X。", flush=True)
             return 0
-        collect(args, keywords, args.output.resolve())
-        print("全部关键词、帖子和作者所在地处理完成。", flush=True)
+        if args.profile_location_backfill_only:
+            collect_profile_locations(args, args.output.resolve())
+            print("自填位置快速补全处理完成；Account based in 队列保持不变。", flush=True)
+        else:
+            collect(args, keywords, args.output.resolve())
+            print("全部关键词、帖子和作者所在地处理完成。", flush=True)
         return 0
     except KeyboardInterrupt:
         print("用户中止；已完成内容已保存，可断点续跑。", file=sys.stderr, flush=True)
