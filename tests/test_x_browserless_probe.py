@@ -131,7 +131,10 @@ def test_visible_login_prompt_does_not_call_network_for_empty_password(tmp_path,
     monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
     async def reachable(_proxy):
         return True
+    async def login_ready():
+        return True
     monkeypatch.setattr(probe, "_network_preflight", reachable)
+    monkeypatch.setattr(probe, "_login_flow_preflight", login_ready)
     monkeypatch.setattr(probe, "_twikit_client", lambda: pytest.fail("must not contact X"))
     args = argparse.Namespace(cookies=tmp_path / "cookies.json", username=None)
     assert asyncio.run(probe._login(args)) == 2
@@ -143,6 +146,20 @@ def test_login_does_not_request_credentials_without_network(tmp_path, monkeypatc
     async def unreachable(_proxy):
         return False
     monkeypatch.setattr(probe, "_network_preflight", unreachable)
+    monkeypatch.setattr("builtins.input", lambda _prompt: pytest.fail("must not request credentials"))
+    args = argparse.Namespace(cookies=tmp_path / "cookies.json", username=None)
+    assert asyncio.run(probe._login(args)) == 1
+    assert "尚未询问账号密码" in capsys.readouterr().err
+    assert not args.cookies.exists()
+
+
+def test_login_does_not_request_credentials_if_library_setup_fails(tmp_path, monkeypatch, capsys):
+    async def reachable(_proxy):
+        return True
+    async def unavailable():
+        return False
+    monkeypatch.setattr(probe, "_network_preflight", reachable)
+    monkeypatch.setattr(probe, "_login_flow_preflight", unavailable)
     monkeypatch.setattr("builtins.input", lambda _prompt: pytest.fail("must not request credentials"))
     args = argparse.Namespace(cookies=tmp_path / "cookies.json", username=None)
     assert asyncio.run(probe._login(args)) == 1

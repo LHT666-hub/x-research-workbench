@@ -66,6 +66,17 @@ async def _network_preflight(proxy: str | None) -> bool:
         return False
 
 
+async def _login_flow_preflight() -> bool:
+    """Verify Twikit can reach its unauthenticated login setup before prompting."""
+    client = _twikit_client()
+    try:
+        return bool(await client._get_guest_token())
+    except Exception:
+        return False
+    finally:
+        await client.http.aclose()
+
+
 def _twikit_client():
     try:
         from twikit import Client
@@ -242,6 +253,9 @@ async def _login(args: argparse.Namespace) -> int:
     proxy = _system_proxy()
     if not await _network_preflight(proxy):
         print("登录前连通性检查失败：Python 尚不能访问 X。请检查系统代理或网络，再重试；尚未询问账号密码。", file=sys.stderr)
+        return 1
+    if not await _login_flow_preflight():
+        print("无账号登录流程预检失败：当前试验库无法完成 X 登录准备步骤。尚未询问账号密码，请勿反复尝试登录。", file=sys.stderr)
         return 1
     cookies.parent.mkdir(parents=True, exist_ok=True)
     username = args.username or input("第六个账号的 X 用户名：").strip().lstrip("@")
