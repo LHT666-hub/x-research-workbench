@@ -201,11 +201,15 @@ async def _login(args: argparse.Namespace) -> int:
         print("该试验会话已存在；不会重复登录或覆盖它。", file=sys.stderr)
         return 2
     cookies.parent.mkdir(parents=True, exist_ok=True)
+    username = args.username or input("第六个账号的 X 用户名：").strip().lstrip("@")
+    if not username:
+        print("未输入用户名；不会尝试登录。", file=sys.stderr)
+        return 2
     email = getpass.getpass("第六个账号的邮箱（可留空，不会显示或写入日志）：") or None
     password = getpass.getpass("第六个账号的 X 密码（不会显示或写入日志）：")
     client = _twikit_client()
     try:
-        await client.login(auth_info_1=args.username, auth_info_2=email,
+        await client.login(auth_info_1=username, auth_info_2=email,
                            password=password, cookies_file=str(cookies))
     except Exception as exc:
         print(f"正常登录未完成：{_error_kind(exc)}。请自行处理任何验证要求；程序不会绕过。", file=sys.stderr)
@@ -255,7 +259,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="第六账号专用的无浏览器小规模试验")
     commands = parser.add_subparsers(dest="command", required=True)
     login = commands.add_parser("login", help="仅用第六个账号正常登录一次")
-    login.add_argument("--username", required=True)
+    login.add_argument("--username", help="省略时在本机终端交互输入")
     login.add_argument("--cookies", type=Path, default=DEFAULT_COOKIES)
     probe = commands.add_parser("probe", help="最多五页，结果独立保存")
     probe.add_argument("--keyword", required=True)

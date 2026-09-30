@@ -80,7 +80,7 @@ py -3 -m venv .venv-browserless
 准备好一个没有被其他采集任务占用的自有账号后，在你自己的电脑终端执行一次正常登录（邮箱和密码只在本机交互输入，不要发给别人或提交到 GitHub）：
 
 ```powershell
-.venv-browserless\Scripts\python.exe tools\x_browserless_probe.py login --username YOUR_SIXTH_ACCOUNT
+.venv-browserless\Scripts\python.exe tools\x_browserless_probe.py login
 ```
 
 登录成功后，选一日最多试探三页；收到 429、401/403 或 404 就停止，不绕过验证码、权限或额度。可只读对比已有 GPT 批次的帖子 ID：
