@@ -10,7 +10,6 @@ import argparse
 import asyncio
 import csv
 from datetime import date, datetime, timedelta, timezone
-import getpass
 import json
 from pathlib import Path
 import re
@@ -205,8 +204,12 @@ async def _login(args: argparse.Namespace) -> int:
     if not username:
         print("未输入用户名；不会尝试登录。", file=sys.stderr)
         return 2
-    email = getpass.getpass("第六个账号的邮箱（可留空，不会显示或写入日志）：") or None
-    password = getpass.getpass("第六个账号的 X 密码（不会显示或写入日志）：")
+    print("注意：下面输入的邮箱和密码会显示在当前终端屏幕上；不要截图或共享屏幕。程序不会把密码写入日志或命令行。")
+    email = input("第六个账号的邮箱（可留空）：").strip() or None
+    password = input("第六个账号的 X 密码（输入时可见）：")
+    if not password:
+        print("未输入密码；不会尝试登录。", file=sys.stderr)
+        return 2
     client = _twikit_client()
     try:
         await client.login(auth_info_1=username, auth_info_2=email,

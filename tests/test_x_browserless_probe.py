@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 from datetime import date, datetime, timezone
 import json
 from pathlib import Path
@@ -123,3 +124,13 @@ def test_search_endpoint_must_come_from_observed_get_csv(tmp_path):
     )
     with pytest.raises(ValueError, match="拒绝猜测"):
         probe.observed_search_endpoint(coverage)
+
+
+def test_visible_login_prompt_does_not_call_network_for_empty_password(tmp_path, monkeypatch, capsys):
+    answers = iter(["testaccount", "optional@example.com", ""])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+    monkeypatch.setattr(probe, "_twikit_client", lambda: pytest.fail("must not contact X"))
+    args = argparse.Namespace(cookies=tmp_path / "cookies.json", username=None)
+    assert asyncio.run(probe._login(args)) == 2
+    assert "会显示在当前终端" in capsys.readouterr().out
+    assert not args.cookies.exists()

@@ -77,7 +77,7 @@ py -3 -m venv .venv-browserless
 .venv-browserless\Scripts\python.exe -m pip install -r requirements-browserless.txt
 ```
 
-准备好一个没有被其他采集任务占用的自有账号后，在你自己的电脑终端执行一次正常登录（邮箱和密码只在本机交互输入，不要发给别人或提交到 GitHub）：
+准备好一个没有被其他采集任务占用的自有账号后，在你自己的电脑终端执行一次正常登录。邮箱和密码会在终端中**可见**，请勿截图或共享屏幕；程序不会将密码加入命令行或日志，也不要把凭据发给别人或提交到 GitHub：
 
 ```powershell
 .venv-browserless\Scripts\python.exe tools\x_browserless_probe.py login
