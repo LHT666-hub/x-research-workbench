@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from pathlib import Path
 
+import pytest
 from playwright.sync_api import sync_playwright
 
 
@@ -74,10 +76,31 @@ def test_dynamic_account_management(tmp_path: Path, monkeypatch) -> None:
     assert not reloaded[created]["active"]
 
 
+def test_account_names_are_unique_and_snapshot_does_not_reparse_raw(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(ui, "OUTPUT_ROOT", tmp_path / "outputs")
+    monkeypatch.setattr(ui, "ACCOUNT_CONFIG_PATH", tmp_path / "account-nodes.json")
+    monkeypatch.setattr(ui, "ACCOUNT_NODES", {
+        "a": {"label": "主账号", "active": True, "session_dir": tmp_path / "session-a"},
+    })
+    manager = ui.JobManager("a")
+    monkeypatch.setattr(ui, "MANAGERS", {"a": manager})
+
+    with pytest.raises(ValueError, match="同名"):
+        ui.create_account_node(" 主账号 ")
+
+    manager.output_dir = tmp_path / "missing-run"
+    manager.can_resume = True
+    monkeypatch.setattr(manager, "_incomplete", lambda _directory: (_ for _ in ()).throw(AssertionError("hot snapshot reparsed raw.json")))
+    snapshot = manager.snapshot(include_logs=False)
+    assert snapshot["can_resume"] is True
+    assert snapshot["logs"] == []
+
+
 def test_account_management_controls_are_present() -> None:
     assert 'id="showAccountManager"' in ui.PAGE
     assert 'id="addAccount"' in ui.PAGE
     assert 'id="accountList"' in ui.PAGE
+    assert 'id="accountManagerStatus"' in ui.PAGE
     assert 'id="stopAll"' in ui.PAGE
     assert 'id="resumeAll"' in ui.PAGE
     assert "radial-gradient(circle at 12% 0%" in ui.PAGE
@@ -94,6 +117,12 @@ def test_account_management_controls_are_present() -> None:
     assert "/api/repair" in ui.PAGE
     assert "window.repairRun" in ui.PAGE
     assert "window.profileBackfillRun" in ui.PAGE
+    assert "window.saveAccountName" in ui.PAGE
+    assert "请勿重复点击" in ui.PAGE
+    assert 'id="historyQuery"' in ui.PAGE
+    assert 'id="historyAccount"' in ui.PAGE
+    assert 'id="historyState"' in ui.PAGE
+    assert 'id="historySort"' in ui.PAGE
 
 
 def test_workbench_page_javascript_loads_without_syntax_errors(tmp_path: Path) -> None:
@@ -109,10 +138,46 @@ def test_workbench_page_javascript_loads_without_syntax_errors(tmp_path: Path) -
         assert page.evaluate("typeof window.backfillRun") == "function"
         assert page.evaluate("typeof window.repairRun") == "function"
         assert page.evaluate("typeof window.profileBackfillRun") == "function"
+        assert page.evaluate("typeof window.saveAccountName") == "function"
+        assert page.evaluate("typeof applyHistoryFilters") == "function"
         assert page.locator("#searchEngine").input_value() == "graphql"
         assert page.locator("#authorStrategy").input_value() == "deferred"
         assert errors == []
         browser.close()
+
+
+def test_account_add_and_inline_rename_from_browser(tmp_path: Path, monkeypatch) -> None:
+    output_root = tmp_path / "outputs"
+    output_root.mkdir()
+    monkeypatch.setattr(ui, "OUTPUT_ROOT", output_root)
+    monkeypatch.setattr(ui, "ACCOUNT_CONFIG_PATH", tmp_path / "account-nodes.json")
+    monkeypatch.setattr(ui, "ACCOUNT_NODES", {
+        "a": {"label": "主账号", "active": True, "session_dir": tmp_path / "session-a"},
+    })
+    monkeypatch.setattr(ui, "MANAGERS", {"a": ui.JobManager("a")})
+    server = ui.ThreadingHTTPServer(("127.0.0.1", 0), ui.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(collector.CHROME), headless=True)
+            page = browser.new_page()
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            page.get_by_role("button", name="＋ 添加/管理账号").click()
+            page.get_by_placeholder("例如：Claude 英文样本").fill("研究账号")
+            page.get_by_role("button", name="添加账号节点").click()
+            page.get_by_text("账号已添加为节点 B").wait_for()
+            row = page.locator(".account-row", has_text="研究账号")
+            row.get_by_role("button", name="重命名").click()
+            page.locator("#accountEdit_b").fill("研究账号 B")
+            page.locator(".account-row.editing").get_by_role("button", name="保存").click()
+            page.get_by_text("节点 B 已重命名为“研究账号 B”").wait_for()
+            assert page.locator(".account-row", has_text="研究账号 B").count() == 1
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_bulk_stop_and_resume(monkeypatch) -> None:
