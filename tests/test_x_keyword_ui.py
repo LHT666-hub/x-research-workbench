@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -173,6 +174,42 @@ def test_account_add_and_inline_rename_from_browser(tmp_path: Path, monkeypatch)
             page.locator(".account-row.editing").get_by_role("button", name="保存").click()
             page.get_by_text("节点 B 已重命名为“研究账号 B”").wait_for()
             assert page.locator(".account-row", has_text="研究账号 B").count() == 1
+            browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_switching_accounts_ignores_old_status_response(tmp_path: Path, monkeypatch) -> None:
+    output_root = tmp_path / "outputs"
+    output_root.mkdir()
+    monkeypatch.setattr(ui, "OUTPUT_ROOT", output_root)
+    monkeypatch.setattr(ui, "ACCOUNT_NODES", {
+        "a": {"label": "账号 A", "active": True, "session_dir": tmp_path / "session-a"},
+        "b": {"label": "账号 B", "active": True, "session_dir": tmp_path / "session-b"},
+    })
+    monkeypatch.setattr(ui, "MANAGERS", {node: ui.JobManager(node) for node in ("a", "b")})
+
+    class SlowAHandler(ui.Handler):
+        def do_GET(self) -> None:
+            if self.path == "/api/status?node=a":
+                time.sleep(0.4)
+            super().do_GET()
+
+    server = ui.ThreadingHTTPServer(("127.0.0.1", 0), SlowAHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(executable_path=str(collector.CHROME), headless=True)
+            page = browser.new_page()
+            page.goto(f"http://127.0.0.1:{server.server_port}/")
+            page.locator("#accountNode option[value=b]").wait_for(state="attached")
+            page.locator("#accountNode").select_option("b")
+            page.locator("#status").get_by_text("账号 B · 空闲").wait_for()
+            page.wait_for_timeout(550)
+            assert page.locator("#status").inner_text() == "账号 B · 空闲"
             browser.close()
     finally:
         server.shutdown()
