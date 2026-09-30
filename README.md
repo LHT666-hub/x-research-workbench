@@ -65,3 +65,28 @@ $env:X_CRAWLER_CHROME = "D:\Apps\Google\Chrome\Application\chrome.exe"
 ```powershell
 .venv\Scripts\python.exe -m pytest -q
 ```
+
+## 无浏览器搜索试验（隔离，不影响现有批次）
+
+`tools/x_browserless_probe.py` 是针对**另一个自有账号**的小规模可行性试验，不会启动 Chrome，不会读取现有账号的 `tmp/chrome-*` 登录资料，也不会修改 A–E 的断点。它使用 Twikit 2.3.3 作为首个候选传输层；Twikit 是非官方项目，能否在当前 X 接口上成功须由真实账号测试确认。它绝不将试验结果标为“当日全量”。
+
+建议建立独立环境，避免改变正在运行的采集器：
+
+```powershell
+py -3 -m venv .venv-browserless
+.venv-browserless\Scripts\python.exe -m pip install -r requirements-browserless.txt
+```
+
+准备好一个没有被其他采集任务占用的自有账号后，在你自己的电脑终端执行一次正常登录（邮箱和密码只在本机交互输入，不要发给别人或提交到 GitHub）：
+
+```powershell
+.venv-browserless\Scripts\python.exe tools\x_browserless_probe.py login --username YOUR_SIXTH_ACCOUNT
+```
+
+登录成功后，选一日最多试探三页；收到 429、401/403 或 404 就停止，不绕过验证码、权限或额度。可只读对比已有 GPT 批次的帖子 ID：
+
+```powershell
+.venv-browserless\Scripts\python.exe tools\x_browserless_probe.py probe --keyword GPT --date 2026-01-01 --max-pages 3 --observed-coverage "C:\Users\LHT\Desktop\Agent\爬虫大法\project\outputs\x_keyword_runs\20260928_122030\coverage_report.csv" --compare-raw "C:\Users\LHT\Desktop\Agent\爬虫大法\project\outputs\x_keyword_runs\20260928_122030\raw.json"
+```
+
+Twikit 2.3.3 内置的搜索 query ID 可能过时；上例的 `--observed-coverage` 只读取我们已实际捕获的搜索路径，不读取任何账号 Cookie，也不会猜接口。如果方法或字段已变化，试验应明确失败并保留原采集方式。试验会话默认保存在被 Git 忽略的 `tmp/browserless_probe/cookies.json`，试验结果保存在 `outputs/browserless_probe/`。会话文件等同登录凭据，请只留在本机且不要共享。`profile_location` 是作者自行填写的资料，不是 `Account based in`；本试验不会查询后者。帖子 ID 重合率只能用于检查方法差异，不能证明 X 搜索结果是平台全量。只有确认多页请求、字段、限流处理和内存表现都稳定后，才考虑将该传输层接入正式工作台。

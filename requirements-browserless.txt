@@ -1,0 +1,2 @@
+# Optional, isolated experiment. Do not install into the live collector environment.
+twikit==2.3.3
