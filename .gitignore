@@ -1,6 +1,7 @@
 # Local Python environment and caches
 .venv/
 .venv-browserless/
+.venv-handoff/
 __pycache__/
 .pytest_cache/
 *.py[cod]

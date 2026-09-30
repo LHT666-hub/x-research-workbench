@@ -66,6 +66,18 @@ $env:X_CRAWLER_CHROME = "D:\Apps\Google\Chrome\Application\chrome.exe"
 .venv\Scripts\python.exe -m pytest -q
 ```
 
+## 第二路线：浏览器登录一次，关闭后用 HTTP 取下一页
+
+当前 Twikit 2.3.3 在 X 的新版 `x-web` 首页上无法完成登录准备，因此不要反复运行下方的 Twikit `login`。`tools/x_browserless_handoff.py` 是独立的替代试验：只为第六账号打开一个**可见**的 Chrome 窗口；你在 X 页面正常登录并自行完成 2FA，程序捕获当前关键词和日期的真实 `SearchTimeline` 请求。浏览器关闭后，它使用同一次会话在 Python 中直接读取**下一页** JSON。这样能实际检验无浏览器的搜索请求是否可行，不猜接口，也不动 A–E。试验收到 429、401、403 或其他 HTTP 错误后不会重试、不会绕过验证。首次只取两页，不能证明全天全量。
+
+本机可在仓库目录直接运行（必须先把已截图泄露的密码修改掉）：
+
+```powershell
+py -3 tools\x_browserless_handoff.py --keyword GPT --date 2026-01-01
+```
+
+在其他电脑上先安装 `requirements-handoff.txt` 到独立环境。第六账号的 Chrome 登录资料仅留在 Git 忽略的 `tmp/browserless_handoff/`，报告写入 Git 忽略的 `outputs/browserless_handoff/`；不要分享或上传这两个目录。程序不接收终端密码，不保存请求 Cookie、Bearer、CSRF 或完整请求头到报告。若关闭浏览器后的 HTTP 请求失败，报告会明确标记，不能将此方法切换到正式采集。
+
 ## 无浏览器搜索试验（隔离，不影响现有批次）
 
 `tools/x_browserless_probe.py` 是针对**另一个自有账号**的小规模可行性试验，不会启动 Chrome，不会读取现有账号的 `tmp/chrome-*` 登录资料，也不会修改 A–E 的断点。它使用 Twikit 2.3.3 作为首个候选传输层；Twikit 是非官方项目，能否在当前 X 接口上成功须由真实账号测试确认。它绝不将试验结果标为“当日全量”。
