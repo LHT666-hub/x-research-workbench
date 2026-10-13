@@ -1,29 +1,31 @@
-# Local Python environment and caches
+# Code repository only: never include research data or account sessions.
 .venv/
-.venv-browserless/
-.venv-handoff/
+.venv-*/
+node_modules/
 __pycache__/
 .pytest_cache/
 *.py[cod]
-
-# Login sessions, cookies and temporary browser state
 tmp/
+browser_data/
 *chrome-profile*/
 *session*/
-
-# Collected research data and runtime logs
 outputs/
-logs/
+output/
+data/
+imports/
 exports/
+logs/
 *.log
-
-# Local configuration and secrets
+*.sqlite*
+*.db
+*.pem
+*.key
 .env
 .env.*
 !.env.example
 config.local.json
-
-# Editor / OS files
+cookies*.json
+*credentials*.json
 .idea/
 .vscode/
 .DS_Store

@@ -1,0 +1,5 @@
+{
+  "policy_id": "verified_404_v2",
+  "enabled_accounts": ["a", "b", "c", "d", "e"],
+  "max_404_verifications_per_slice": 1
+}

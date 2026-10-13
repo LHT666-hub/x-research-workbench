@@ -137,12 +137,15 @@ def _search_run_key(run: dict[str, Any]) -> tuple[str, str, str]:
 
 
 def _search_run_needs_retry(run: dict[str, Any]) -> bool:
-    return str(run.get("stop_reason", "")) in {"no_network_response", "pagination_not_triggered"} or str(run.get("coverage_status", "")) == "needs_retry"
+    from x_keyword_collector import search_run_needs_retry
+    return search_run_needs_retry(run)
 
 
 def repair_queue_rows(raw: dict[str, Any]) -> list[dict[str, Any]]:
     coverage = [run for run in raw.get("search_runs", []) if isinstance(run, dict)]
     reliable = {_search_run_key(run) for run in coverage if not _search_run_needs_retry(run)}
+    if raw.get("repair_policy") == "coverage_first":
+        reliable.update(_search_run_key(run) for run in coverage if int(run.get("count", 0) or 0) > 0)
     pending: dict[tuple[str, str, str], dict[str, Any]] = {}
     attempts: dict[tuple[str, str, str], int] = {}
     for run in coverage:
@@ -188,8 +191,9 @@ def profile_location_queue_rows(raw: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def reliable_slice_count(raw: dict[str, Any]) -> int:
+    from x_keyword_collector import search_end_verified
     coverage = [run for run in raw.get("search_runs", []) if isinstance(run, dict)]
-    return len({_search_run_key(run) for run in coverage if not _search_run_needs_retry(run)})
+    return len({_search_run_key(run) for run in coverage if search_end_verified(run)})
 
 
 def history_rows() -> list[dict[str, Any]]:
@@ -357,8 +361,10 @@ def run_details(run_id: str) -> dict[str, Any]:
         "run_id": run_id, "config": config, "status": status, "keywords": requested,
         "account_node": node, "account_label": node_label(node),
         "phase": phase, "is_running": is_running, "finalized": finalized, "posts_count": len(posts),
-        "posts_preview": posts[-200:], "coverage": coverage,
+        "posts_preview": posts[-200:], "coverage": [classified_coverage_view(r) for r in coverage],
         "expected_slices": expected_slices, "completed_slices": completed_slices,
+        "all_date_ends_verified": bool(expected_slices) and completed_slices>=expected_slices,
+        "completion_basis": 'task_lifecycle_not_platform_all_posts',
         "unique_authors": unique_authors, "resolved_authors": sum(author.get("status") != "pending" for author in authors),
         "known_locations": sum(bool(author.get("account_based_in")) for author in authors),
         "profile_locations": sum(bool(author.get("profile_location")) for author in authors),
@@ -428,10 +434,18 @@ let statusRequest=null,statusVersion=0;function showStatusLoading(){const select
 async function refresh(force=false){const selected=el('accountNode').value;if(!selected)return;if(statusRequest){if(!force)return;statusRequest.abort()}const request=new AbortController(),version=++statusVersion;statusRequest=request;try{const s=await api('/api/status?node='+encodeURIComponent(selected),{signal:request.signal});if(version!==statusVersion||selected!==el('accountNode').value)return;renderNodes(s.nodes);el('status').textContent=s.node_label+' · '+s.label;el('dot').className='dot '+s.status;start.disabled=s.status==='running';stop.disabled=s.status!=='running';resume.disabled=s.status==='running'||!s.can_resume;log.textContent=s.logs.length?s.logs.join('\n'):'等待任务……';log.scrollTop=log.scrollHeight;el('output').textContent=s.output_dir?'输出目录：'+s.output_dir:'尚未开始。';currentRunId=s.output_dir?s.output_dir.replaceAll('\\','/').split('/').filter(Boolean).pop():'';if(currentRunId)el('currentDetail').classList.remove('hidden');else el('currentDetail').classList.add('hidden');if(s.result_url){result.href=s.result_url;result.classList.remove('hidden')}else result.classList.add('hidden')}catch(e){if(version===statusVersion&&e.name!=='AbortError')el('status').textContent='状态读取失败：'+e.message}finally{if(statusRequest===request)statusRequest=null}}el('currentDetail').onclick=()=>currentRunId&&viewRun(currentRunId);const reuseRunBase=window.reuseRun;window.reuseRun=i=>{const wanted=historyCache[i].account_node||'a';if(accountsCache.some(a=>a.id===wanted&&a.active))el('accountNode').value=wanted;reuseRunBase(i);showStatusLoading();refresh(true)};el('accountNode').onchange=()=>{showStatusLoading();refresh(true)};el('refreshNodes').onclick=()=>{loadAccounts().catch(()=>{});refresh(true)};applyMode();applyPace();loadHistory();loadAccounts().then(()=>refresh(true)).catch(()=>{});setInterval(refresh,2000);setInterval(loadHistory,60000);</script></body></html>"""
 
 
-PAGE = PAGE.replace("滚动到无新增", "Cursor / 滚动到无新增").replace(
+def classified_coverage_view(run):
+    from x_keyword_collector import classify_search_run
+    derived=classify_search_run(run)
+    return {**run,**derived,'source_coverage_status':run.get('coverage_status'),
+            'coverage_status':derived['state_label']}
+
+
+PAGE = PAGE.replace("任务已完成", "采集任务已结束（不等于各日期已到底）").replace("可靠搜索片", "已核验到底搜索片").replace("滚动到无新增", "Cursor / 滚动到无新增").replace(
     "持续滚动到网页不再返回新帖子",
     "持续翻页到 X 不再返回新帖子",
 )
+PAGE=PAGE.replace('帖子采集完成，所在地补全队列已保存','采样任务结束，作者队列已保留（到底状态见各日期）')
 
 
 def read_json(path: Path, default: object) -> object:
@@ -495,6 +509,8 @@ class JobManager:
         if profile_location_backfill_only: cmd.append("--profile-location-backfill-only")
         return cmd
     def _launch(self,directory:Path,config:dict[str,Any],resume:bool=False,profile_location_backfill_only:bool=False)->None:
+        if read_json(directory/"raw.json",{}).get("guard_hold"):
+            raise RuntimeError("数据质量保护暂停：先核验日期查询和响应，再人工解除保护；不能直接恢复空跑。")
         self.operation="profile_location" if profile_location_backfill_only else "collect"
         self.status="running"; self.label="正在快速补自填位置" if profile_location_backfill_only else ("正在继续采集" if resume else "正在采集"); self.output_dir=directory; self.result_url=""; self.can_resume=False
         if not resume:self.logs=[]

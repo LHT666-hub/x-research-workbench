@@ -1,0 +1,120 @@
+{
+  "snapshot_date": "2026-10-13",
+  "source_root": "project",
+  "release_mirror": "x-research-workbench",
+  "research_data_uploaded": false,
+  "login_sessions_uploaded": false,
+  "scope": "Selected current X tools; historical experimental tools retained separately by documentation; SHA256 describes local source bytes before Git newline normalization.",
+  "files": [
+    {
+      "path": "tools/x_keyword_collector.py",
+      "source": "project/tools/x_keyword_collector.py",
+      "sha256": "5b7a92811b69e1c0a4f784b7123404f44cc998739517152f29b1568135660c56"
+    },
+    {
+      "path": "tools/x_keyword_ui.py",
+      "source": "project/tools/x_keyword_ui.py",
+      "sha256": "7a4d92f9b95d6415d32ab4efefbddf0cf6bdba44a9ac49c2fafcc237169d9e5a"
+    },
+    {
+      "path": "tools/x_account_collector.py",
+      "source": "project/tools/x_account_collector.py",
+      "sha256": "df49652a1b9fc7b87e8b630770a9e5ff45a50c7145a15c026a6d66aef0f54b04"
+    },
+    {
+      "path": "tools/x_account_ui.py",
+      "source": "project/tools/x_account_ui.py",
+      "sha256": "bbd4fc81b9653153caa36fab2507e7576d9be047e6ac219d015e1d29fccb234e"
+    },
+    {
+      "path": "tools/x_about_network_probe.py",
+      "source": "project/tools/x_about_network_probe.py",
+      "sha256": "abaf1303996aa3f827553ecb9e9fc6cb1f22c5771e0730708fa1ca0e7686e5bc"
+    },
+    {
+      "path": "tools/x_continue_saved_cursors.py",
+      "source": "project/tools/x_continue_saved_cursors.py",
+      "sha256": "8e6828207a2fbae3f0a2385a3e299181c0d58bf6327413c9dd4bcb85ccbbe6b8"
+    },
+    {
+      "path": "tools/x_recovery_policy.py",
+      "source": "project/tools/x_recovery_policy.py",
+      "sha256": "a34bbbd8a1780a2d2f988f99e2068e84f2ff68d68f84a769e12ecce41dab4f37"
+    },
+    {
+      "path": "tools/x_plan_cursor_continuation.py",
+      "source": "project/tools/x_plan_cursor_continuation.py",
+      "sha256": "c3c99cecb2d894a4e89308c0145b104291190d76ecb4d827ffad77e8032d2bec"
+    },
+    {
+      "path": "tools/x_export_column_txt.py",
+      "source": "project/tools/x_export_column_txt.py",
+      "sha256": "f9053d14a533b5497102b1d2e4d0210627f81ad10a7918af1c7001783423b15a"
+    },
+    {
+      "path": "tools/x_guard_audit.py",
+      "source": "project/tools/x_guard_audit.py",
+      "sha256": "1b379ca8f0893cf84044fa58d041a1261750aaf4c0df291ecaac8dac1476be60"
+    },
+    {
+      "path": "tools/x_snapshot_cursor_continuation.py",
+      "source": "project/tools/x_snapshot_cursor_continuation.py",
+      "sha256": "b13fb21aa75b30fcb7cc6fa23051f13c846018da2379770027ab02eaab3cc84d"
+    },
+    {
+      "path": "tools/x_probe_continuation_404.py",
+      "source": "project/tools/x_probe_continuation_404.py",
+      "sha256": "28b4d068c93fc2672d0f29f9f887675913bb209486907f7293a7ffe390d5555b"
+    },
+    {
+      "path": "tools/x_apply_404_recovery.py",
+      "source": "project/tools/x_apply_404_recovery.py",
+      "sha256": "f6d764453908aea411f4f17c5e3da6207b4404d03337c2b0c8853d3352f69b76"
+    },
+    {
+      "path": "tools/x_rollout_recovery_policy.py",
+      "source": "project/tools/x_rollout_recovery_policy.py",
+      "sha256": "3c12a512e08cbc92eaf5ee7491e11a35629d2ed61450df3c733dc85335abf218"
+    },
+    {
+      "path": "tools/x_run_quality_supplement.py",
+      "source": "project/tools/x_run_quality_supplement.py",
+      "sha256": "e1fd337d89e7553195173d7e6e178cc37d70e68ecc8846cbdd182ce9357dc19d"
+    },
+    {
+      "path": "tools/x_prepare_staged_collection.py",
+      "source": "project/tools/x_prepare_staged_collection.py",
+      "sha256": "c5878a443f3e25d0440077b09b75526c25db610ed470276fce7e2c6ff70bcbc5"
+    },
+    {
+      "path": "tools/x_screen_quality.py",
+      "source": "project/tools/x_screen_quality.py",
+      "sha256": "ef4f0d741fcded3063f70204974a1766b34d6cd6320c2e15682d867d725e74aa"
+    },
+    {
+      "path": "tools/x_quality_review.py",
+      "source": "project/tools/x_quality_review.py",
+      "sha256": "524718df092840f1800b5140d4448b3962197ccfb9752e20bbd6bf76298b0cc8"
+    },
+    {
+      "path": "tools/x_verify_search_bottom.py",
+      "source": "project/tools/x_verify_search_bottom.py",
+      "sha256": "15de87c017eb3a86f00dc903d71b70c9f6b43794ccb0c49a0f505fef0ef33434"
+    },
+    {
+      "path": "tools/x_probe_terminal_cursor.py",
+      "source": "project/tools/x_probe_terminal_cursor.py",
+      "sha256": "5d55e9476092126d5ab915f3fdfbdf8421095491258e1fa0461d0181248763ca"
+    },
+    {
+      "path": "tools/x_compare_ab_verification.py",
+      "source": "project/tools/x_compare_ab_verification.py",
+      "sha256": "c5b8b20035c46f97eaec04b946142a5c6a06b3f7463cd2f9e97b8c5a693c6637"
+    },
+    {
+      "path": "tools/x_record_experiment_tails.py",
+      "source": "project/tools/x_record_experiment_tails.py",
+      "sha256": "c1f76ea03f8b09c921c52b728bddbc080c29440034c2c44e27e97867bd7c56bd"
+    }
+  ]
+}

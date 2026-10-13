@@ -4,7 +4,6 @@ import argparse
 import csv
 import html
 import json
-import os
 import random
 import re
 import sys
@@ -20,24 +19,7 @@ from playwright.sync_api import sync_playwright
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SESSION_DIR = ROOT / "tmp" / "chrome-x-account-profile"
 OUTPUT_ROOT = ROOT / "outputs" / "x_account_runs"
-
-
-def find_chrome() -> Path:
-    """Locate Chrome on common Windows installations or via X_CRAWLER_CHROME."""
-    configured = os.environ.get("X_CRAWLER_CHROME", "").strip()
-    candidates = [
-        Path(configured) if configured else None,
-        Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
-    ]
-    for candidate in candidates:
-        if candidate and candidate.is_file():
-            return candidate
-    return Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
-
-
-CHROME = find_chrome()
+CHROME = Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
 
 FIELDS = [
     "requested_username", "username", "user_id", "display_name",

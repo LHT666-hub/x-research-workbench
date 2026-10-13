@@ -51,7 +51,7 @@ def test_history_and_cross_run_dedup(tmp_path: Path, monkeypatch) -> None:
     assert detail["resolved_authors"] == 1
     assert detail["known_locations"] == 1
     assert detail["profile_location_backlog_count"] == 1
-    assert detail["can_profile_backfill"]
+    assert not detail["can_profile_backfill"]  # Unknown search end is not trustworthy completion.
 
 
 def test_dynamic_account_management(tmp_path: Path, monkeypatch) -> None:
@@ -280,10 +280,10 @@ def test_history_exposes_abnormal_date_repair_queue(tmp_path: Path, monkeypatch)
     row = ui.history_rows()[0]
     detail = ui.run_details(run_id)
 
-    assert row["repair_queue_count"] == 1
+    assert row["repair_queue_count"] == 2
     assert row["can_repair"]
-    assert detail["completed_slices"] == 1
-    assert detail["repair_queue_count"] == 1
+    assert detail["completed_slices"] == 0
+    assert detail["repair_queue_count"] == 2
     assert detail["repair_queue"][0]["slice_start"] == "2026-01-01"
 
 
