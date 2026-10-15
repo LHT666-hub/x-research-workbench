@@ -14,12 +14,12 @@
     {
       "path": "tools/x_keyword_ui.py",
       "source": "project/tools/x_keyword_ui.py",
-      "sha256": "0ed4aa42637a8eaa4ed08d051f5eaca68287634bce3c0d6a8c4116f7fbda927a"
+      "sha256": "cd1e90ffa8a34e2a17485870c9959a2afa6ac947af809946f2f6014e72de0ec0"
     },
     {
       "path": "tools/x_account_collector.py",
       "source": "project/tools/x_account_collector.py",
-      "sha256": "df49652a1b9fc7b87e8b630770a9e5ff45a50c7145a15c026a6d66aef0f54b04"
+      "sha256": "c774edb55aed10d1c581759fac8b05fa6f2fc71c6d687d6f047ff4bcd901b950"
     },
     {
       "path": "tools/x_account_ui.py",
@@ -134,12 +134,12 @@
     {
       "path": "docs/MODULAR_ARCHITECTURE.md",
       "source": "project/docs/MODULAR_ARCHITECTURE.md",
-      "sha256": "46c3e0fe0d76d21bc4afedc8a8f44fd22fda417a13e8abbfe8931b7b00abce2d"
+      "sha256": "d457fa6b1bf810e0cb0208ccb8eb484402731a4abcf7359270413eae4edc8372"
     },
     {
       "path": "tools/x_workbench/__init__.py",
       "source": "project/tools/x_workbench/__init__.py",
-      "sha256": "2684728846ce269aff41d0c0b3216e8fcd58e50a596829bcb4c894e45fb33518"
+      "sha256": "01101605b96f0e9bcb26ed52b9848f1a53771a837d810e03500c7809f100ebbe"
     },
     {
       "path": "tools/x_workbench/browser.py",
@@ -235,7 +235,23 @@
       "path": "tests/test_x_verified_resume.py",
       "source": "project/tests/test_x_verified_resume.py",
       "sha256": "8fa29ebd8f573407b9895c2e4c8af340c5881f4c1977ef0fc0be7c763d09cdff"
+    },
+    {
+      "path": "tools/x_doctor.py",
+      "source": "project/tools/x_doctor.py",
+      "sha256": "93ce688cd361984502b47a908c45f3238e9ec8aedacd58fde4523e6c872978c1"
+    },
+    {
+      "path": "tools/x_workbench/runtime.py",
+      "source": "project/tools/x_workbench/runtime.py",
+      "sha256": "f25ca41a318672111c22d73187fc9d4ad949518e1b8463815101128fa2179296"
+    },
+    {
+      "path": "tests/test_x_runtime.py",
+      "source": "project/tests/test_x_runtime.py",
+      "sha256": "c42dff020c696a78cb0fe96a91cc311df53e1ee380b91997ad55400d92d70de3"
     }
   ],
-  "revision_notes": "Modularization and efficiency phase 2: append-only checkpoint deltas/day index, response archive reuse, single initial parse, queue reuse, exclusive stage timing. SQLite remains opt-in; no real-account HTTP speed validation or production transport switch."
+  "revision_notes": "Modularization and efficiency phase 2: append-only checkpoint deltas/day index, response archive reuse, single initial parse, queue reuse, exclusive stage timing. SQLite remains opt-in; no real-account HTTP speed validation or production transport switch.",
+  "release_version": "0.3.1"
 }

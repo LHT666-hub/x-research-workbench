@@ -1,0 +1,30 @@
+name: Regression tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-synthetic:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies and isolated test Chromium
+        run: |
+          python -m pip install -r requirements-dev.txt
+          python -m playwright install chromium
+          $testBrowser = python -c "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); print(p.chromium.executable_path); p.stop()"
+          "X_WORKBENCH_CHROME=$testBrowser" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Regression tests (synthetic data and local pages only)
+        run: python -m pytest tests -q
+      - name: Check CLI version
+        run: python tools/x_keyword_ui.py --version

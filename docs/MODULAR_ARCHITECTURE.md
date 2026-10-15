@@ -1,4 +1,6 @@
-# 模块化与性能改造第一阶段（2026-10-15）
+# 模块化与性能改造（设计与兼容记录）
+
+当前软件版本 0.3.1；安装和当前能力以根 README、CHANGELOG、DATA_LAYOUT 为准。以下包含分阶段实现记录，不是要求正在运行的任务重新升级。新增 runtime.py 负责本地环境自检和 Chrome 发现，不登录或发起采集。
 
 本版本不启动旧任务、不改历史 raw/config/queue、不迁移账号、不恢复定时心跳。旧 CLI、导入路径、字段和结束判据保持兼容；没有真实 X 速度结论。
 
@@ -46,7 +48,7 @@ HTTP 层没有直接接入 twscrape，没有复制上游源码、读取原 A–E
 
 ### 可选 SQLite（当前只接入独立 cursor 续采）
 
-`x_continue_saved_cursors.py` 增加 `--checkpoint-backend sqlite`；默认仍为 `json`。这是存储选择，不改变关键词、账号、日期、排序、graphql/deferred/3/15000、coverage_first 或退避。没有对现有任务执行该选项。
+`x_continue_saved_cursors.py` 增加 `--checkpoint-backend sqlite`；CLI默认仍为 `json`。这是存储选择，不改变关键词、账号、日期、排序、graphql/deferred/3/15000、coverage_first 或退避。本机已有独立任务在此前明确授权恢复时已显式使用SQLite；安装或更新本软件本身不迁移任何任务。
 
 启用后，输出目录中：
 

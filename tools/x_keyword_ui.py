@@ -19,6 +19,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from x_workbench.state import read_state, STATE_NAMES
+from x_workbench import __version__
+from x_workbench.runtime import diagnose_runtime, print_diagnostics
 from x_workbench.continuation_view import continuation_view, plan_paths, audit_continuations, worker_observations
 
 
@@ -30,10 +32,10 @@ CONTINUATION_ROOT = ROOT / "outputs" / "cursor_continuation_20261012"
 MAX_KEYWORDS = 500
 ACCOUNT_CONFIG_PATH = ROOT / "tmp" / "x-account-nodes.json"
 DEFAULT_ACCOUNT_LABELS = {
-    "a": "账号 A（现有 GPT 会话）",
-    "b": "账号 B（独立 Claude 会话）",
-    "c": "账号 C（独立研究会话）",
-    "d": "账号 D（独立研究会话）",
+    "a": "账号 A（请使用自己的登录会话）",
+    "b": "账号 B（独立登录会话）",
+    "c": "账号 C（独立登录会话）",
+    "d": "账号 D（独立登录会话）",
 }
 
 
@@ -783,6 +785,25 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"error":"页面不存在"},HTTPStatus.NOT_FOUND)
     def do_POST(self)->None:
         try:
+            # The local UI is not a public API. Block cross-origin browser writes.
+            origin = self.headers.get("Origin")
+            if origin:
+                try:
+                    parsed_origin = urllib.parse.urlsplit(origin)
+                    allowed = (parsed_origin.scheme == "http" and parsed_origin.hostname in {"127.0.0.1", "localhost"}
+                               and (parsed_origin.port or 80) == self.server.server_address[1]
+                               and not parsed_origin.username and not parsed_origin.password)
+                except ValueError:
+                    allowed = False
+                if not allowed:
+                    self.send_json({"error": "拒绝跨站修改请求；请从本机工作台页面操作。"}, HTTPStatus.FORBIDDEN)
+                    return
+            if self.headers.get("Sec-Fetch-Site", "") == "cross-site":
+                self.send_json({"error": "拒绝跨站修改请求。"}, HTTPStatus.FORBIDDEN)
+                return
+            if self.headers.get_content_type() != "application/json":
+                self.send_json({"error": "修改请求必须为 application/json。"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                return
             data=self.read_json()
             if self.path=="/api/accounts/create":
                 node_id=create_account_node(data.get("label"));self.send_json({"ok":True,"created_id":node_id,"accounts":accounts_payload()});return
@@ -836,9 +857,28 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main()->int:
-    parser=argparse.ArgumentParser(description="X关键词帖子采集器本地界面");parser.add_argument("--host",default="127.0.0.1");parser.add_argument("--port",type=int,default=8766);parser.add_argument("--no-open",action="store_true");args=parser.parse_args()
+    parser=argparse.ArgumentParser(description="X关键词帖子采集器本地界面")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--no-open", action="store_true")
+    parser.add_argument("--doctor", action="store_true", help="只检查本地安装，不启动服务、浏览器或采集")
+    parser.add_argument("--version", action="version", version=f"X Research Workbench {__version__}")
+    args=parser.parse_args()
+    if args.doctor:
+        return print_diagnostics(diagnose_runtime(ROOT))
+    if args.host not in {"127.0.0.1", "localhost"}:
+        parser.error("工作台没有远程访问鉴权，仅允许 127.0.0.1 / localhost；公开源码不等于开放本地服务。")
+    if not 0 <= args.port <= 65535:
+        parser.error("端口必须在 0—65535 之间。")
     if not PYTHON.exists():raise SystemExit(f"未找到项目 Python：{PYTHON}")
-    OUTPUT_ROOT.mkdir(parents=True,exist_ok=True);server=ThreadingHTTPServer((args.host,args.port),Handler);url=f"http://{args.host}:{args.port}/";print(f"X关键词帖子采集器已启动：{url}");print("保持此窗口打开；按 Ctrl+C 关闭。")
+    OUTPUT_ROOT.mkdir(parents=True,exist_ok=True)
+    try:
+        server=ThreadingHTTPServer((args.host,args.port),Handler)
+    except OSError as exc:
+        raise SystemExit("工作台端口无法绑定；请先检查是否已启动，不要重复启动或终止其他进程。可用 --port 8767 选择另一端口。") from exc
+    url=f"http://{args.host}:{server.server_address[1]}/"
+    print(f"X Research Workbench {__version__} 已启动：{url}")
+    print("仅供本机使用；不要通过公网隧道暴露此服务。保持此窗口打开；按 Ctrl+C 关闭页面服务。")
     if not args.no_open:threading.Timer(.5,lambda:webbrowser.open(url)).start()
     try:server.serve_forever()
     except KeyboardInterrupt:print("\n页面服务已关闭。")

@@ -1,0 +1,3 @@
+# Local/CI synthetic test dependencies; not needed for ordinary browser collection.
+-r requirements.txt
+httpx>=0.27,<1

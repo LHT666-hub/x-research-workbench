@@ -14,12 +14,13 @@ from urllib.parse import unquote, urlsplit
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
+from x_workbench.runtime import discover_chrome
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SESSION_DIR = ROOT / "tmp" / "chrome-x-account-profile"
 OUTPUT_ROOT = ROOT / "outputs" / "x_account_runs"
-CHROME = Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+CHROME = discover_chrome()
 
 FIELDS = [
     "requested_username", "username", "user_id", "display_name",
