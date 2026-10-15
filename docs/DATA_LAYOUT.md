@@ -10,6 +10,8 @@
 |10月12日游标续采|outputs/cursor_continuation_20261012/{a,b,c,d,e}/collection/continuation_raw.json|从历史检查点增加的数据；同目录status.json、日志、search_end_evidence、404_verification记录证据|
 |原五批TXT快照|outputs/exports_txt_20261008/*_posts.txt|10月8日导出快照，不包含后续所有增量|
 |续采新增TXT|outputs/cursor_continuation_20261012/<node>/collection/<BATCH>_continuation_new_posts.txt|只有续采新增；需与原数据及前轮补采按ID/URL去重合并|
+|工作台即时TXT快照|outputs/current_checkpoint_exports/<node>_<时间戳>.txt|从同一权威版本生成；相邻.receipt.json记录版本、行数、哈希，仍仅包含该续采新增|
+|安全恢复与验收记录|outputs/resume_authoritative_20261015/<时间戳>/|恢复前备份、worker日志、report.json；本机实际验收另存acceptance.json|
 |正文命中/待复核|outputs/quality_iteration_20261008/|body_hit.txt、body_not_hit_review.txt、每日质量表；正文未命中不直接等于无关|
 |结束对照实验|outputs/search_halves_20261012/、search_bottom_20261012*/、terminal_cursor_probe_20261012*/|实验样本和证据，不等于全研究最终数据|
 |登录状态|tmp/chrome-x-keyword-profile*|Cookie及账号浏览器资料；只在本机，不能上传或共享|
@@ -26,8 +28,8 @@
 
 **没有一个现有TXT可以直接称为“截至当前所有数据已合并的最终版”。** 原五批、前轮补采、10月12日续采分别保存，应在稳定快照上按帖子ID/URL去重后生成新合并导出，并保留来源清单。
 
-TXT为UTF-8 BOM、制表符分栏，一条帖子一行；正文换行转义为`\n`。用Excel导入时选UTF-8和制表符，长帖子ID按文本处理。JSON是原始结构化主数据，TXT是阅读/分析导出，不是恢复检查点。
+TXT为UTF-8 BOM、制表符分栏，一条帖子一行；正文换行转义为`\n`，引号为普通文字。用Excel导入时选UTF-8和制表符，长帖子ID按文本处理；程序读取时禁用CSV引号解释。JSON或显式启用的SQLite是结构化主数据，TXT是阅读/分析导出，不是恢复检查点。
 
-2026-10-15新增可选存储：只有显式以`--checkpoint-backend sqlite`启动独立续采时，`continuation_raw.sqlite3`才是该续采的权威检查点，原JSON变成可能滞后的兼容快照；`status.json`会明确标注。现有五批没有执行转换。用`tools/x_read_checkpoint.py <continuation_raw.json>`读取权威状态；旧直接读取JSON的统计脚本不能当作SQLite模式的实时台账。WAL备份、哈希锚点及保护规则见[模块与存储说明](MODULAR_ARCHITECTURE.md)。
+2026-10-15新增可选存储：只有显式以`--checkpoint-backend sqlite`启动独立续采时，`continuation_raw.sqlite3`才是该续采的权威检查点，原JSON变成可能滞后的兼容快照；`status.json`会明确标注。安装或更新代码不会自动转换原始五批。本机经用户授权恢复的五个独立续采worker已显式使用SQLite，原五批raw/config/queue不迁移、不覆盖。当前工作台独立面板、续采审计和即时TXT统一读取权威版本；`tools/x_read_checkpoint.py <continuation_raw.json>`也识别权威状态。历史直接读取JSON的脚本仍不能当SQLite实时台账。WAL备份、哈希锚点及保护规则见[模块与存储说明](MODULAR_ARCHITECTURE.md)。
 
 移动证据文件会改变其绝对路径；结束判定需要重新关联并校验SHA256。现在不搬迁原始数据或浏览器目录，避免破坏断点和证据关联。
