@@ -20,168 +20,69 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from x_account_collector import CHROME, about_result, now_iso, wait_for_login
+# Compatibility facade: existing script imports remain valid.
+from x_workbench.query import (
+    parse_date,
+    build_search_query,
+    post_in_date_range,
+    make_date_slices,
+)
+from x_workbench.parsing import (
+    SearchRateLimitError,
+    _nested_dict,
+    _unwrap_tweet_result,
+    _tweet_results,
+    _bottom_cursor,
+    _twitter_time_to_iso,
+    validate_search_payload,
+    parse_search_timeline,
+)
+from x_workbench.request_identity import (
+    _search_url_with_cursor,
+    _search_raw_query,
+    _search_request_cursor,
+    _search_response_matches,
+    _response_headers,
+    _search_template,
+    _graphql_operation,
+)
+from x_workbench.policy import (
+    _cursor_only_empty_payload,
+    validated_empty_tail,
+    search_end_verified,
+    response_end_evidence_valid,
+    classify_search_run,
+    search_run_key,
+    search_run_needs_retry,
+    reliable_search_keys,
+    accepted_search_keys,
+    settle_saved_in_progress,
+    search_repair_queue,
+)
+from x_workbench.browser import (
+    _BufferedSearchResponse,
+    _take_buffered_response,
+    _scroll_last_tweet_if_attached,
+    _next_browser_signed_search_response,
+    _fresh_browser_cursor_response,
+)
+from x_workbench.policy import RETRYABLE_SEARCH_STOP_REASONS, EMPTY_TAIL_REQUIRED_RESPONSES, EMPTY_TAIL_POLICY
+from x_workbench.storage import write_json_atomic as _write_json_atomic
+from x_workbench.evidence import EvidenceCache, evidence_cache_scope
+from x_workbench.metrics import (
+    StageTimings,
+    current_timings,
+    timing_scope,
+    measure,
+    measured_sleep,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SESSION_DIR = ROOT / "tmp" / "chrome-x-keyword-profile"
 OUTPUT_ROOT = ROOT / "outputs" / "x_keyword_runs"
 SHARED_ABOUT_COOLDOWN = ROOT / "tmp" / "x-about-cooldown.json"
-RETRYABLE_SEARCH_STOP_REASONS = {"no_network_response", "pagination_not_triggered", "date_filter_mismatch"}
-EMPTY_TAIL_REQUIRED_RESPONSES = 3
-EMPTY_TAIL_POLICY = "empty_tail_v1"
-
-
-def _cursor_only_empty_payload(payload: object) -> bool:
-    """Recognise the observed cursor-only tail, not filtered/tombstone tweets."""
-    try:
-        instructions = payload['data']['search_by_raw_query']['search_timeline']['timeline']['instructions']
-    except (KeyError, TypeError):
-        return False
-    if not isinstance(instructions, list) or not instructions or not _bottom_cursor(payload):
-        return False
-    for instruction in instructions:
-        if not isinstance(instruction, dict) or instruction.get('type') != 'TimelineReplaceEntry':
-            return False
-        entry = instruction.get('entry')
-        if not isinstance(entry, dict) or not isinstance(entry.get('content'), dict):
-            return False
-        content = entry['content']
-        if content.get('cursorType') not in {'Top', 'Bottom'} or not content.get('value'):
-            return False
-    return True
-
-
-def validated_empty_tail(run: dict[str, object]) -> bool:
-    """A label alone never clears retry: require intact raw evidence and chain."""
-    proof = run.get('search_end_evidence')
-    if not isinstance(proof, dict) or proof.get('policy') != EMPTY_TAIL_POLICY:
-        return False
-    try:
-        valid_counts=int(run.get('count',0) or 0)>0 and int(run.get('date_rejected_count',0) or 0)==0
-    except (ValueError,TypeError):
-        return False
-    if not valid_counts:
-        return False
-    pages = proof.get('responses', [])
-    if not isinstance(pages, list) or len(pages) < EMPTY_TAIL_REQUIRED_RESPONSES:
-        return False
-    if len({p.get('response_file') for p in pages if isinstance(p, dict)}) != len(pages):
-        return False
-    previous = None
-    try:
-        for item in pages:
-            if item['http_status'] != 200 or item['query'] != run.get('query') or not item['request_cursor_matches'] or item['parsed_count'] != 0:
-                return False
-            if previous is not None and item['request_cursor'] != previous:
-                return False
-            raw = Path(item['response_file']).read_bytes()
-            if hashlib.sha256(raw).hexdigest() != item['sha256']:
-                return False
-            payload = json.loads(raw)
-            validate_search_payload(payload)
-            if not _cursor_only_empty_payload(payload) or _bottom_cursor(payload) != item['next_cursor']:
-                return False
-            previous = item['next_cursor']
-    except (OSError, KeyError, TypeError, ValueError, RuntimeError):
-        return False
-    return True
-
-
-def search_end_verified(run: dict[str, object]) -> bool:
-    return classify_search_run(run)['search_end_verified']
-
-
-def response_end_evidence_valid(run: dict[str, object]) -> bool:
-    proof=run.get('search_end_evidence', {})
-    try:
-        rejected=int(run.get('date_rejected_count',0) or 0)
-    except (ValueError,TypeError):
-        return False
-    if not isinstance(proof,dict) or proof.get('policy')!='response_end_v1' or rejected:
-        return False
-    pages=proof.get('responses',[])
-    if not isinstance(pages,list) or len(pages)!=1:
-        return False
-    try:
-        item=pages[0]
-        if item['http_status']!=200 or item['query']!=run.get('query') or not item['request_cursor_matches'] or item['next_cursor']:
-            return False
-        raw=Path(item['response_file']).read_bytes()
-        if hashlib.sha256(raw).hexdigest()!=item['sha256']:
-            return False
-        payload=json.loads(raw); validate_search_payload(payload)
-        instructions=payload['data']['search_by_raw_query']['search_timeline']['timeline']['instructions']
-        known={'TimelineAddEntries','TimelineReplaceEntry','TimelineTerminateTimeline','TimelineClearCache','TimelinePinEntry'}
-        return isinstance(instructions,list) and bool(instructions) and all(isinstance(i,dict) and i.get('type') in known for i in instructions) and not _bottom_cursor(payload)
-    except (OSError,KeyError,ValueError,TypeError,RuntimeError):
-        return False
-
-
-def classify_search_run(run: dict[str, object]) -> dict[str, object]:
-    """Single read-only taxonomy; never infer exhaustion from sample acceptance."""
-    reason=str(run.get('stop_reason') or 'unknown')
-    error=' '.join(str(run.get(k,'') or '') for k in ('error','interruption_error'))
-    guard=run.get('guard_hold')
-    if guard:
-        error+=' '+str(guard)
-    query=str(run.get('query','') or '')
-    try:
-        rejected=int(run.get('date_rejected_count',0) or 0)
-        count=int(run.get('count',0) or 0)
-        invalid_counts=rejected<0 or count<0
-    except (ValueError,TypeError):
-        rejected=0; invalid_counts=True
-    bounds=re.search(r'since:(\d{4}-\d{2}-\d{2})\s+until:(\d{4}-\d{2}-\d{2})',query)
-    verified=False
-    if invalid_counts:
-        code,label,category='invalid_status_record','计数/状态记录损坏，禁止判断到底','quality_hold'
-    elif (bounds and bounds[1]>=bounds[2]) or reason=='date_filter_mismatch' or 'date_filter_mismatch' in error or rejected>0:
-        code,label,category='date_query_invalid','日期查询/响应不一致，待核验','quality_hold'
-    elif re.search(r'HTTP\s*(401|403)|requires login|登录失效|验证码',error,re.I):
-        code,label,category='authentication_hold','登录/权限/验证码保护','protection_hold'
-    elif re.search(r'HTTP\s*404',error,re.I):
-        code,label,category='endpoint_hold','搜索接口404，待核验','protection_hold'
-    elif re.search(r'PermissionError|No space left|磁盘|写入失败',error,re.I):
-        code,label,category='storage_failure','磁盘写入失败，不是网络结束','protection_hold'
-    elif reason in {'user_paused','manual_pause'} or run.get('pause_kind')=='user':
-        code,label,category='user_paused','人工暂停，未声明采完','manual_pause'
-    elif guard:
-        code,label,category='guard_hold','保护暂停，未声明采完','protection_hold'
-    elif reason in {'rate_limited','cooldown','http_429'} or re.search(r'HTTP\s*429',error,re.I):
-        code,label,category='rate_limited','合法限流等待，不是采完','cooldown'
-    elif 'ERR_ABORTED' in error or reason=='request_aborted':
-        code,label,category='request_aborted','请求被取消，取消来源须另查','technical_interruption'
-    elif re.search(r'Target.*closed|BrowserContext.close|浏览器.*断',error,re.I):
-        code,label,category='browser_disconnected','浏览器连接中断，未确认结束','technical_interruption'
-    elif reason=='validated_empty_tail':
-        verified=run.get('coverage_status')!='needs_retry' and validated_empty_tail(run)
-        code,label,category=('validated_empty_tail','已核验空尾部（非平台全量）','verified_search_end') if verified else ('invalid_end_evidence','空尾部证据缺失/无效，待核验','quality_hold')
-    elif reason=='cursor_exhausted':
-        verified=run.get('coverage_status')!='needs_retry' and response_end_evidence_valid(run)
-        code,label,category=('response_end','成功响应无后续游标，证据已核验','verified_search_end') if verified else ('recorded_cursor_end','旧记录称无游标，原始证据待核验','legacy_unverified')
-        if not verified and isinstance(run.get('search_end_evidence'),dict) and run['search_end_evidence'].get('policy')=='response_end_v1':
-            code,label,category='invalid_end_evidence','无游标结束证据不完整/无效，待核验','quality_hold'
-    elif reason=='no_new_results':
-        code,label,category='no_new_results','无新增保护停止，不证明空尾部','heuristic_stop'
-    elif reason=='repeated_cursor':
-        code,label,category='repeated_cursor','重复游标防循环停止，不证明到底','heuristic_stop'
-    elif reason in {'target_reached','max_pages','max_scrolls'}:
-        code,label,category=reason,{'target_reached':'达到条数目标','max_pages':'达到页数上限','max_scrolls':'达到滚动上限'}[reason]+'，未确认结束','budget_stop'
-    elif reason in {'pagination_not_triggered','no_network_response'}:
-        code,label,category=reason,{'pagination_not_triggered':'未取得匹配的下一页响应','no_network_response':'未取得搜索响应'}[reason]+'，未确认结束','technical_interruption'
-    elif reason=='in_progress':
-        code,label,category='in_progress','进行中/未结算检查点，不算完成','in_progress'
-    elif reason=='interrupted_with_saved_sample':
-        code,label,category='interrupted_with_saved_sample','中断且样本已保留，未确认结束','technical_interruption'
-    else:
-        code,label,category='unknown_stop','未知停止原因，不推断采完','unknown'
-    proof=run.get('search_end_evidence',{})
-    candidate=not verified and isinstance(proof,dict) and bool(proof.get('responses')) and proof.get('policy')==EMPTY_TAIL_POLICY
-    underlying=classify_search_run({**run,'guard_hold':None,'error':error})['state_code'] if code=='guard_hold' else code
-    return {'state_code':code,'search_end_status':code,'state_label':label,'state_category':category,'underlying_state_code':underlying,
-        'search_end_verified':verified,'empty_tail_candidate':candidate,
-        'search_end_scope':'exact_query_this_account_not_platform_all_posts',
-        'platform_all_posts_proven':False}
+_STATUS_EVIDENCE_CACHE = EvidenceCache()
 
 
 class RateLimitError(RuntimeError):
@@ -299,120 +200,6 @@ def safe_name(value: str) -> str:
     return cleaned[:60] or "keyword"
 
 
-def parse_date(value: str | None) -> date | None:
-    if not value:
-        return None
-    return date.fromisoformat(value)
-
-
-def build_search_query(keyword: str, start_date: date | None, end_date: date | None, timezone_offset: float = 8) -> str:
-    parts = [keyword.strip()]
-    local_tz = timezone(timedelta(hours=timezone_offset))
-    if start_date:
-        lower = datetime.combine(start_date, datetime.min.time(), tzinfo=local_tz)
-        parts.append(f"since_time:{int(lower.timestamp())}")
-    if end_date:
-        # Half-open instant range implements an inclusive local calendar end date.
-        upper = datetime.combine(end_date + timedelta(days=1), datetime.min.time(), tzinfo=local_tz)
-        parts.append(f"until_time:{int(upper.timestamp())}")
-    return " ".join(parts)
-
-
-def search_run_key(run: dict[str, object]) -> tuple[str, str, str]:
-    return (
-        str(run.get("keyword", "")),
-        str(run.get("slice_start", "")),
-        str(run.get("slice_end", "")),
-    )
-
-
-def search_run_needs_retry(run: dict[str, object]) -> bool:
-    if run.get('stop_reason') == 'validated_empty_tail':
-        return not validated_empty_tail(run) or run.get('coverage_status') == 'needs_retry'
-    classification=classify_search_run(run)
-    if classification['state_category'] in {'quality_hold','protection_hold'}:
-        return True
-    if run.get('stop_reason')=='cursor_exhausted':
-        return not classification['search_end_verified']
-    return (
-        str(run.get("stop_reason", "")) in RETRYABLE_SEARCH_STOP_REASONS
-        or str(run.get("coverage_status", "")) == "needs_retry"
-        # Heuristic stopping is not an end-of-search proof, even with samples.
-        or run.get('stop_reason') in {'no_new_results','repeated_cursor'}
-        or str(run.get("stop_reason", "")) not in {"cursor_exhausted", "no_new_results", "repeated_cursor", "target_reached", "max_pages"}
-    )
-
-
-def reliable_search_keys(search_runs: object) -> set[tuple[str, str, str]]:
-    if not isinstance(search_runs, list):
-        return set()
-    return {
-        search_run_key(run)
-        for run in search_runs
-        if isinstance(run, dict) and search_end_verified(run)
-    }
-
-
-def accepted_search_keys(search_runs: object) -> set[tuple[str, str, str]]:
-    """Coverage-first sampling accepts partial days without claiming exhaustion."""
-    keys = reliable_search_keys(search_runs)
-    if isinstance(search_runs, list):
-        keys.update(search_run_key(run) for run in search_runs
-                    if isinstance(run, dict) and int(run.get("count", 0) or 0) > 0)
-        # Preserve the user's no-auto-rerun rule for recorded zero cursor ends;
-        # this is sampling acceptance, explicitly not verified exhaustion.
-        keys.update(search_run_key(run) for run in search_runs if isinstance(run,dict)
-                    and not int(run.get('count',0) or 0) and run.get('stop_reason')=='cursor_exhausted'
-                    and classify_search_run(run)['state_code']=='recorded_cursor_end')
-    return keys
-
-
-def settle_saved_in_progress(search_runs: list[dict[str, object]]) -> int:
-    """At resume only, settle abandoned samples without erasing their checkpoints."""
-    latest = {search_run_key(run): run for run in search_runs}
-    additions = []
-    for run in latest.values():
-        if run.get("stop_reason") == "in_progress" and int(run.get("count", 0) or 0) > 0:
-            additions.append({**run, "stop_reason": "interrupted_with_saved_sample",
-                              "coverage_status": "needs_retry",
-                              "interruption_error": "Previous process ended before slice completion; cause unknown",
-                              "resolution_kind": "abandoned_checkpoint_settlement_no_network",
-                              "resolved_at": now_iso(),
-                              "source_checkpoint_at": run.get("checkpoint_at", "")})
-    search_runs.extend(additions)
-    return len(additions)
-
-
-def search_repair_queue(search_runs: object, policy: str = "strict") -> list[dict[str, object]]:
-    """Return unresolved date slices that must be replayed before completion."""
-    if not isinstance(search_runs, list):
-        return []
-    reliable = accepted_search_keys(search_runs) if policy == "coverage_first" else reliable_search_keys(search_runs)
-    grouped: dict[tuple[str, str, str], list[dict[str, object]]] = {}
-    for run in search_runs:
-        if not isinstance(run, dict) or not search_run_needs_retry(run):
-            continue
-        key = search_run_key(run)
-        if key in reliable:
-            continue
-        grouped.setdefault(key, []).append(run)
-    queue: list[dict[str, object]] = []
-    for key, attempts in grouped.items():
-        latest = attempts[-1]
-        queue.append({
-            "keyword": key[0],
-            "keyword_index": int(latest.get("keyword_index", 0) or 0),
-            "slice_start": key[1],
-            "slice_end": key[2],
-            "attempts": len(attempts),
-            "last_stop_reason": str(latest.get("stop_reason", "")),
-            "partial_post_count": max(int(run.get("count", 0) or 0) for run in attempts),
-            "last_attempt_at": str(latest.get("completed_at", "")),
-            "status": "pending",
-        })
-    return sorted(queue, key=lambda row: (int(row.get("keyword_index", 0)), str(row.get("slice_start", ""))))
-
-
 def profile_location_needs_lookup(author: object) -> bool:
     if not isinstance(author, dict) or not str(author.get("username", "") or "").strip():
         return False
@@ -435,29 +222,6 @@ def profile_location_queue(authors: object) -> list[dict[str, object]]:
             "error": str(author.get("profile_location_error", "") or ""),
         })
     return sorted(rows, key=lambda item: str(item["username"]).casefold())
-
-
-def post_in_date_range(posted_at: str, start_date: date | None, end_date: date | None, timezone_offset: float = 8) -> bool:
-    if not posted_at:
-        return True
-    try:
-        local_tz = timezone(timedelta(hours=timezone_offset))
-        value = datetime.fromisoformat(posted_at.replace("Z", "+00:00")).astimezone(local_tz).date()
-    except ValueError:
-        return True
-    return (not start_date or value >= start_date) and (not end_date or value <= end_date)
-
-
-def make_date_slices(start_date: date | None, end_date: date | None, slice_days: int) -> list[tuple[date | None, date | None]]:
-    if not start_date or not end_date or slice_days <= 0:
-        return [(start_date, end_date)]
-    output: list[tuple[date, date]] = []
-    cursor = start_date
-    while cursor <= end_date:
-        slice_end = min(end_date, cursor + timedelta(days=slice_days - 1))
-        output.append((cursor, slice_end))
-        cursor = slice_end + timedelta(days=1)
-    return output
 
 
 def text_or_empty(locator) -> str:
@@ -715,6 +479,12 @@ async function loadRuns(){const select=byId('runSwitcher');try{const response=aw
 
 
 def _status_payload(payload: dict[str, object]) -> dict[str, object]:
+    # Cache is restricted to live status, never final acceptance/resume checks.
+    with evidence_cache_scope(_STATUS_EVIDENCE_CACHE), measure("status_build"):
+        return _build_status_payload(payload)
+
+
+def _build_status_payload(payload: dict[str, object]) -> dict[str, object]:
     coverage = list(payload.get("search_runs", []))
     completed = reliable_search_keys(coverage)
     repair_queue = search_repair_queue(coverage, str(payload.get("repair_policy", "strict")))
@@ -742,19 +512,6 @@ def _status_payload(payload: dict[str, object]) -> dict[str, object]:
         "finalized": bool(payload.get("finalized", False)),
         "updated_at": now_iso(),
     }
-
-
-def _write_json_atomic(path: Path, value: object) -> None:
-    temporary = path.with_name(f"{path.name}.tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    for attempt in range(8):
-        try:
-            temporary.replace(path)
-            return
-        except PermissionError:
-            if attempt >= 7:
-                raise
-            time.sleep(0.12 * (attempt + 1))
 
 
 def save_checkpoint(output_dir: Path, payload: dict[str, object]) -> None:
@@ -875,241 +632,6 @@ def collect_search(page, keyword: str, keyword_index: int, limit: int, max_scrol
     return selected, coverage
 
 
-class SearchRateLimitError(RuntimeError):
-    def __init__(self, retry_after: float | None = None) -> None:
-        super().__init__("SearchTimeline HTTP 429")
-        self.retry_after = retry_after
-
-
-def _nested_dict(value: object, *keys: str) -> dict[str, object]:
-    current = value
-    for key in keys:
-        if not isinstance(current, dict):
-            return {}
-        current = current.get(key)
-    return current if isinstance(current, dict) else {}
-
-
-def _unwrap_tweet_result(result: object) -> dict[str, object]:
-    current = result
-    for _ in range(4):
-        if not isinstance(current, dict):
-            return {}
-        if isinstance(current.get("tweet"), dict) and not isinstance(current.get("legacy"), dict):
-            current = current["tweet"]
-            continue
-        if isinstance(current.get("result"), dict) and not isinstance(current.get("legacy"), dict):
-            current = current["result"]
-            continue
-        break
-    return current if isinstance(current, dict) else {}
-
-
-def _tweet_results(payload: object):
-    """Yield only primary timeline tweet results, not nested quote/retweet payloads."""
-    if isinstance(payload, dict):
-        tweet_results = payload.get("tweet_results")
-        if isinstance(tweet_results, dict) and isinstance(tweet_results.get("result"), dict):
-            yield _unwrap_tweet_result(tweet_results["result"])
-            return
-        for value in payload.values():
-            yield from _tweet_results(value)
-    elif isinstance(payload, list):
-        for value in payload:
-            yield from _tweet_results(value)
-
-
-def _bottom_cursor(payload: object) -> str:
-    candidates: list[str] = []
-
-    def visit(value: object) -> None:
-        if isinstance(value, dict):
-            entry_id = str(value.get("entryId", value.get("entry_id", "")) or "").casefold()
-            cursor_type = str(value.get("cursorType", value.get("cursor_type", "")) or "").casefold()
-            content = value.get("content") if isinstance(value.get("content"), dict) else value
-            cursor = ""
-            if isinstance(content, dict):
-                cursor = str(content.get("value", "") or "")
-                cursor_type = str(content.get("cursorType", content.get("cursor_type", cursor_type)) or cursor_type).casefold()
-            if cursor and ("cursor-bottom" in entry_id or cursor_type == "bottom"):
-                candidates.append(cursor)
-            for child in value.values():
-                visit(child)
-        elif isinstance(value, list):
-            for child in value:
-                visit(child)
-
-    visit(payload)
-    return candidates[-1] if candidates else ""
-
-
-def _twitter_time_to_iso(value: object) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    try:
-        return email.utils.parsedate_to_datetime(text).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-    except (TypeError, ValueError):
-        return text
-
-
-def validate_search_payload(payload: object) -> None:
-    if not isinstance(payload, dict):
-        raise RuntimeError("SearchTimeline 响应不是 JSON 对象")
-    errors = payload.get("errors")
-    if errors:
-        codes = [str(error.get("code", "unknown")) for error in errors if isinstance(error, dict)] if isinstance(errors, list) else ["unknown"]
-        if "88" in codes:
-            raise SearchRateLimitError(None)
-        raise RuntimeError("SearchTimeline 返回接口错误，code=" + ",".join(codes))
-
-
-def parse_search_timeline(payload: object, keyword: str, keyword_index: int) -> tuple[list[dict[str, object]], str]:
-    rows: list[dict[str, object]] = []
-    seen: set[str] = set()
-    collected_at = now_iso()
-    for raw_result in _tweet_results(payload):
-        result = _unwrap_tweet_result(raw_result)
-        legacy = result.get("legacy") if isinstance(result.get("legacy"), dict) else {}
-        post_id = str(result.get("rest_id") or legacy.get("id_str") or "")
-        if not post_id or post_id in seen:
-            continue
-        user_result = _nested_dict(result, "core", "user_results", "result")
-        if not user_result:
-            user_result = _nested_dict(result, "author_results", "result")
-        user_result = _unwrap_tweet_result(user_result)
-        user_legacy = user_result.get("legacy") if isinstance(user_result.get("legacy"), dict) else {}
-        user_core = user_result.get("core") if isinstance(user_result.get("core"), dict) else {}
-        user_location = user_result.get("location") if isinstance(user_result.get("location"), dict) else {}
-        profile_location = str(user_location.get("location") or user_legacy.get("location") or "")
-        username = str(user_core.get("screen_name") or user_legacy.get("screen_name") or "")
-        if not username:
-            continue
-        note = _nested_dict(result, "note_tweet", "note_tweet_results", "result")
-        text = str(note.get("text") or legacy.get("full_text") or legacy.get("text") or "").strip()
-        if not text:
-            continue
-        seen.add(post_id)
-        rows.append({
-            "keyword": keyword,
-            "keyword_index": keyword_index,
-            "rank": 0,
-            "post_id": post_id,
-            "post_url": f"https://x.com/{username}/status/{post_id}",
-            "post_text": text,
-            "posted_at": _twitter_time_to_iso(legacy.get("created_at")),
-            "time_label": "",
-            "author_username": username,
-            "author_display_name": str(user_core.get("name") or user_legacy.get("name") or ""),
-            "author_user_id": str(user_result.get("rest_id") or user_legacy.get("id_str") or ""),
-            "profile_location": profile_location,
-            "profile_location_status": "success" if profile_location else "pending",
-            "profile_location_error": "",
-            "profile_location_collected_at": collected_at if profile_location else "",
-            "account_based_in": "",
-            "source": "search_timeline_graphql",
-            "account_lookup_status": "pending",
-            "collected_at": collected_at,
-        })
-    return rows, _bottom_cursor(payload)
-
-
-def _search_url_with_cursor(url: str, cursor: str) -> str:
-    parts = urlsplit(url)
-    query = parse_qs(parts.query, keep_blank_values=True)
-    values = query.get("variables")
-    if not values:
-        raise RuntimeError("SearchTimeline 请求中没有 variables")
-    variables = json.loads(values[0])
-    if not isinstance(variables, dict):
-        raise RuntimeError("SearchTimeline variables 格式无效")
-    if cursor:
-        variables["cursor"] = cursor
-    else:
-        variables.pop("cursor", None)
-    query["variables"] = [json.dumps(variables, separators=(",", ":"), ensure_ascii=False)]
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query, doseq=True), parts.fragment))
-
-
-def _search_raw_query(url: str, body: str | None = None) -> str:
-    """Extract rawQuery so a delayed response from an older date slice cannot be mistaken for the new one."""
-    try:
-        values = parse_qs(urlsplit(url).query, keep_blank_values=True).get("variables", [])
-        variables = json.loads(values[0]) if values else {}
-        if isinstance(variables, dict) and variables.get("rawQuery") is not None:
-            return str(variables["rawQuery"])
-    except (ValueError, TypeError, json.JSONDecodeError):
-        pass
-    if body:
-        try:
-            parsed = json.loads(body)
-            variables = parsed.get("variables", parsed) if isinstance(parsed, dict) else {}
-            if isinstance(variables, dict) and variables.get("rawQuery") is not None:
-                return str(variables["rawQuery"])
-        except (ValueError, TypeError, json.JSONDecodeError):
-            pass
-    return ""
-
-
-def _search_request_cursor(url: str, body: str | None = None) -> str:
-    """Read the request cursor, never replay requests or expose signed headers."""
-    values = parse_qs(urlsplit(url).query, keep_blank_values=True).get("variables", [])
-    for value in [*(values[:1]), body]:
-        if not value:
-            continue
-        try:
-            parsed = json.loads(value)
-            variables = parsed.get("variables", parsed) if isinstance(parsed, dict) else {}
-            if isinstance(variables, str):
-                variables = json.loads(variables)
-            if isinstance(variables, dict):
-                return str(variables.get("cursor") or "")
-        except (ValueError, TypeError):
-            continue
-    return ""
-
-
-def _search_response_matches(response, expected_query: str, expected_cursor: str | None = None) -> bool:
-    if "SearchTimeline" not in response.url:
-        return False
-    actual = _search_raw_query(response.url, response.request.post_data)
-    if " ".join(actual.split()) != " ".join(expected_query.split()):
-        return False
-    # A matching-query HTTP error must reach the existing reset/guard handling;
-    # it must not be misreported as a pagination timeout.
-    if response.status != 200:
-        return True
-    return expected_cursor is None or _search_request_cursor(response.url, response.request.post_data) == expected_cursor
-
-
-def _response_headers(response) -> dict[str, str]:
-    return {
-        name: response.header_value(name) or ""
-        for name in ("retry-after", "x-rate-limit-limit", "x-rate-limit-reset", "x-rate-limit-remaining")
-    }
-
-
-def _search_template(response) -> dict[str, object]:
-    request = response.request
-    forwarded = {
-        "authorization", "content-type", "x-csrf-token", "x-twitter-active-user",
-        "x-twitter-auth-type", "x-twitter-client-language",
-    }
-    return {
-        "url": response.url,
-        "method": request.method,
-        "headers": {key: value for key, value in request.all_headers().items() if key.lower() in forwarded},
-        "body": request.post_data,
-    }
-
-
-def _graphql_operation(url: str) -> tuple[str, str]:
-    """Return audit-safe endpoint metadata without cookies or authorization."""
-    path = urlsplit(url).path
-    operation = path.rstrip("/").split("/")[-1] if path else ""
-    return operation, path
-
-
 def _replay_search(page, template: dict[str, object], cursor: str) -> tuple[dict[str, object], dict[str, str]]:
     url = _search_url_with_cursor(str(template["url"]), cursor)
     replay = page.evaluate(
@@ -1143,113 +665,6 @@ def _replay_search(page, template: dict[str, object], cursor: str) -> tuple[dict
     return payload, headers
 
 
-class _BufferedSearchResponse:
-    """Snapshot a browser-created response before Chrome evicts its body.
-
-    No requests are issued. Preserve headers and errors for existing protection
-    and authoritative reset handling instead of converting failures to empties.
-    """
-    def __init__(self, response):
-        self.original = response
-        self.url, self.status, self.request = response.url, response.status, response.request
-        self._headers = _response_headers(response)
-        self._payload = None
-        self._error = None
-        self._failure_body = None
-        if self.status == 200:
-            try:
-                self._payload = response.json()
-            except Exception as exc:
-                self._error = exc
-        elif self.status == 429:
-            self._failure_body = {'body_not_read_for_rate_limit':True}
-        else:
-            try:
-                self._failure_body = response.json()
-            except Exception:
-                try:
-                    self._failure_body = {'text':response.text()[:262144]}
-                except Exception as exc:
-                    self._failure_body = {'body_unavailable':str(exc)}
-
-    def header_value(self, name):
-        return self._headers.get(name.lower(), "")
-
-    def json(self):
-        if self._error is not None:
-            raise self._error
-        return self._payload
-
-
-def _take_buffered_response(response, buffered_responses):
-    if buffered_responses is not None:
-        for index, cached in enumerate(buffered_responses):
-            if getattr(cached, 'original', None) is response:
-                return buffered_responses.pop(index)
-    return response
-
-
-def _scroll_last_tweet_if_attached(tweets):
-    """Virtualized tweets can detach between lookup and scrolling; retain the UI trigger."""
-    try:
-        tweets.last.scroll_into_view_if_needed(timeout=5_000)
-        return tweets.last.bounding_box()
-    except Exception as exc:
-        if "Element is not attached to the DOM" not in str(exc):
-            raise
-        print("  [分页诊断] 时间线元素已被虚拟化移除，继续原滚动触发；不算查询结束。", flush=True)
-        return None
-
-
-def _next_browser_signed_search_response(page, query: str, attempts: int = 3, timeout_ms: int = 15_000, expected_cursor: str | None = None, buffered_responses=None):
-    """Let X create a fresh transaction id, retrying the physical pagination trigger when the UI stalls."""
-    for attempt in range(1, attempts + 1):
-        if buffered_responses is not None:
-            # The UI may prefetch while we parse/save the previous page. Do not
-            # wait for a second physical trigger of an already-issued request.
-            page.wait_for_timeout(1)
-            for index, response in enumerate(buffered_responses):
-                if _search_response_matches(response, query, expected_cursor):
-                    buffered_responses.pop(index)
-                    print("  [分页诊断] 使用已捕获且查询/游标匹配的浏览器预加载响应。", flush=True)
-                    return response, attempt
-        try:
-            with page.expect_response(
-                lambda response: _search_response_matches(response, query, expected_cursor),
-                timeout=timeout_ms,
-            ) as pending:
-                # X virtualizes its timeline, so use increasingly strong UI gestures.
-                # The request remains created by X itself (including its one-use
-                # transaction id); we only retrigger the visible pagination sentinel.
-                if attempt == 1:
-                    # Position the pointer inside the actual timeline rather
-                    # than scrolling whichever pane currently owns the mouse.
-                    tweets = page.locator("article[data-testid='tweet']")
-                    if tweets.count():
-                        box = _scroll_last_tweet_if_attached(tweets)
-                        if box:
-                            page.mouse.move(box["x"] + box["width"] / 2, box["y"] + min(box["height"] / 2, 40))
-                    page.mouse.wheel(0, 3200)
-                    page.keyboard.press("End")
-                elif attempt == 2:
-                    page.mouse.wheel(0, -900)
-                    page.wait_for_timeout(500)
-                    page.mouse.wheel(0, 5200)
-                    page.keyboard.press("End")
-                else:
-                    tweets = page.locator("article[data-testid='tweet']")
-                    if tweets.count():
-                        _scroll_last_tweet_if_attached(tweets)
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    page.keyboard.press("End")
-            return _take_buffered_response(pending.value, buffered_responses), attempt
-        except PlaywrightTimeoutError:
-            print(f"  [分页诊断] 触发 {attempt}/{attempts} 超时；未收到当前查询且请求游标匹配的响应，不算游标耗尽。", flush=True)
-            if attempt < attempts:
-                page.wait_for_timeout(700 + attempt * 500)
-    return None, attempts
-
-
 def checked_search_response(response, evidence_dir=None, expected_query=None, expected_cursor=None):
     """Keep authoritative reset/backoff attached even when JSON parsing fails."""
     headers = _response_headers(response)
@@ -1281,26 +696,17 @@ def checked_search_response(response, evidence_dir=None, expected_query=None, ex
         raise
 
 
-def _fresh_browser_cursor_response(page, query, cursor, buffered_responses=None):
-    """Verify a candidate empty tail with one fresh browser-signed request."""
-    redirected = []
-    def redirect(route):
-        request = route.request
-        if not redirected and request.method == 'GET' and _search_raw_query(request.url, request.post_data) == query and _search_request_cursor(request.url, request.post_data) == '':
-            redirected.append(True)
-            route.continue_(url=_search_url_with_cursor(request.url, cursor))
-        else:
-            route.continue_()
-    page.route('**/*SearchTimeline*', redirect)
-    try:
-        with page.expect_response(lambda r: _search_response_matches(r, query, cursor), timeout=60_000) as pending:
-            page.reload(wait_until='domcontentloaded', timeout=60_000)
-        return _take_buffered_response(pending.value, buffered_responses)
-    finally:
-        page.unroute('**/*SearchTimeline*', redirect)
-
-
 def collect_search_graphql(page, keyword: str, keyword_index: int, limit: int, max_pages: int, output_dir: Path, start_date: date | None = None, end_date: date | None = None, search_type: str = "live", no_growth_stop: int = 5, request_delay_min: float = 2, request_delay_max: float = 4, timezone_offset: float = 8, pagination_trigger_attempts: int = 3, pagination_trigger_timeout_ms: int = 15_000, checkpoint=None, resume_record=None, seed_rows=None) -> tuple[list[dict[str, object]], dict[str, object]]:
+    timings = current_timings() or StageTimings()
+    with timing_scope(timings):
+        try:
+            with measure("search_total"):
+                return _collect_search_graphql_listening(page, keyword, keyword_index, limit, max_pages, output_dir, start_date, end_date, search_type, no_growth_stop, request_delay_min, request_delay_max, timezone_offset, pagination_trigger_attempts, pagination_trigger_timeout_ms, checkpoint, resume_record, seed_rows)
+        finally:
+            _write_json_atomic(output_dir / "timings.json", timings.snapshot())
+
+
+def _collect_search_graphql_listening(page, keyword, keyword_index, limit, max_pages, output_dir, start_date, end_date, search_type, no_growth_stop, request_delay_min, request_delay_max, timezone_offset, pagination_trigger_attempts, pagination_trigger_timeout_ms, checkpoint, resume_record, seed_rows):
     query = build_search_query(keyword, start_date, end_date, timezone_offset)
     buffer = []
     def capture(response):
@@ -1316,7 +722,29 @@ def collect_search_graphql(page, keyword: str, keyword_index: int, limit: int, m
             page.remove_listener('response', capture)
 
 
-def _collect_search_graphql_impl(page, keyword: str, keyword_index: int, limit: int, max_pages: int, output_dir: Path, start_date: date | None = None, end_date: date | None = None, search_type: str = "live", no_growth_stop: int = 5, request_delay_min: float = 2, request_delay_max: float = 4, timezone_offset: float = 8, pagination_trigger_attempts: int = 3, pagination_trigger_timeout_ms: int = 15_000, checkpoint=None, buffered_responses=None, resume_record=None, seed_rows=None) -> tuple[list[dict[str, object]], dict[str, object]]:
+def collect_search_http(transport, keyword, keyword_index, limit, max_pages, output_dir, start_date=None, end_date=None, *, search_type="live", no_growth_stop=5, request_delay_min=2, request_delay_max=4, timezone_offset=8, checkpoint=None, resume_record=None, seed_rows=None):
+    """Isolated experimental API; caller supplies fresh signing and its own client.
+
+    Not exposed by the production UI/CLI. Same parser, end policy, checkpoints
+    and pacing as the browser route. This is not a real-session validation.
+    """
+    if search_type != 'live':
+        raise ValueError('Experimental HTTP validation currently requires Latest')
+    if request_delay_min < 2 or request_delay_max < request_delay_min or not 1 <= max_pages <= 1000:
+        raise ValueError('HTTP pilot requires delay >=2 seconds and page budget 1..1000')
+    query = build_search_query(keyword, start_date, end_date, timezone_offset)
+    if transport.query != query:
+        raise ValueError('Experimental HTTP query mismatch')
+    timings = current_timings() or StageTimings()
+    with timing_scope(timings):
+        try:
+            with measure('search_total'):
+                return _collect_search_graphql_impl(None, keyword, keyword_index, limit, max_pages, output_dir, start_date, end_date, search_type, no_growth_stop, request_delay_min, request_delay_max, timezone_offset, checkpoint=checkpoint, resume_record=resume_record, seed_rows=seed_rows, transport=transport)
+        finally:
+            _write_json_atomic(output_dir / 'timings.json', timings.snapshot())
+
+
+def _collect_search_graphql_impl(page, keyword: str, keyword_index: int, limit: int, max_pages: int, output_dir: Path, start_date: date | None = None, end_date: date | None = None, search_type: str = "live", no_growth_stop: int = 5, request_delay_min: float = 2, request_delay_max: float = 4, timezone_offset: float = 8, pagination_trigger_attempts: int = 3, pagination_trigger_timeout_ms: int = 15_000, checkpoint=None, buffered_responses=None, resume_record=None, seed_rows=None, transport=None) -> tuple[list[dict[str, object]], dict[str, object]]:
     query = build_search_query(keyword, start_date, end_date, timezone_offset)
     offset = 0
     resume_cursor = ''
@@ -1334,9 +762,12 @@ def _collect_search_graphql_impl(page, keyword: str, keyword_index: int, limit: 
     suffix = "&f=live" if search_type == "live" else ""
     url = f"https://x.com/search?q={quote(query)}&src=typed_query{suffix}"
     try:
-        with page.expect_response(lambda r: _search_response_matches(r, query, ""), timeout=90_000) as pending:
-            page.goto(url, wait_until="domcontentloaded", timeout=90_000)
-        response = _take_buffered_response(pending.value, buffered_responses)
+        if transport is None:
+            with measure("request_wait"), page.expect_response(lambda r: _search_response_matches(r, query, ""), timeout=90_000) as pending:
+                page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+            response = _take_buffered_response(pending.value, buffered_responses)
+        else:
+            response = transport.fetch('')
     except PlaywrightTimeoutError as exc:
         raise RuntimeError("未捕获到 SearchTimeline JSON 响应") from exc
     if response.status == 429:
@@ -1355,8 +786,8 @@ def _collect_search_graphql_impl(page, keyword: str, keyword_index: int, limit: 
         pause = random.uniform(request_delay_min,request_delay_max)
         if state.get('remaining',999) <= 5 and state.get('reset',0) > time.time():
             pause = max(pause,state['reset']-time.time()+random.uniform(5,20))
-        time.sleep(pause)
-        response = _fresh_browser_cursor_response(page,query,resume_cursor,buffered_responses)
+        measured_sleep(pause)
+        response = _fresh_browser_cursor_response(page,query,resume_cursor,buffered_responses) if transport is None else transport.fetch(resume_cursor)
         first_payload = checked_search_response(response,output_dir/'search_failure_evidence',query,resume_cursor)
         print(f'[精确游标续采] 从已保存页 {offset} 的下一页开始；首页仅健康检查，不入库。',flush=True)
     elif not first_rows and first_cursor:
@@ -1368,10 +799,13 @@ def _collect_search_graphql_impl(page, keyword: str, keyword_index: int, limit: 
         if state.get("remaining", 999) <= 5 and reset > time.time():
             pause = max(pause, reset - time.time() + random.uniform(5, 20))
         print(f"[空响应保护] 首页零条但含游标；等待 {pause / 60:.1f} 分钟后重新加载同一查询，不推进日期。", flush=True)
-        time.sleep(pause)
-        with page.expect_response(lambda r: _search_response_matches(r, query, ""), timeout=90_000) as refreshed:
-            page.reload(wait_until="domcontentloaded", timeout=90_000)
-        response = _take_buffered_response(refreshed.value, buffered_responses)
+        measured_sleep(pause)
+        if transport is None:
+            with measure("request_wait"), page.expect_response(lambda r: _search_response_matches(r, query, ""), timeout=90_000) as refreshed:
+                page.reload(wait_until="domcontentloaded", timeout=90_000)
+            response = _take_buffered_response(refreshed.value, buffered_responses)
+        else:
+            response = transport.fetch('')
         if response.status == 429:
             raise SearchRateLimitError(_retry_after_seconds(_response_headers(response)))
         first_payload = checked_search_response(response,output_dir/'search_failure_evidence',query,'')
@@ -1437,24 +871,25 @@ def _collect_search_graphql_impl(page, keyword: str, keyword_index: int, limit: 
         parsed_total += len(parsed)
         added = 0
         date_rejected = 0
-        for row in parsed:
-            if not post_in_date_range(str(row.get("posted_at", "")), start_date, end_date, timezone_offset):
-                date_rejected += 1
-                date_rejected_total += 1
-                stamp = str(row.get("posted_at", ""))
-                if stamp not in returned_date_examples and len(returned_date_examples) < 5:
-                    returned_date_examples.append(stamp)
-                continue
-            post_id = str(row.get("post_id", ""))
-            if not post_id or post_id in seen:
-                duplicate_total += 1
-                continue
-            seen.add(post_id)
-            row["rank"] = len(rows) + 1
-            rows.append(row)
-            added += 1
-            if limit > 0 and len(rows) >= limit:
-                break
+        with measure("date_filter_dedup"):
+            for row in parsed:
+                if not post_in_date_range(str(row.get("posted_at", "")), start_date, end_date, timezone_offset):
+                    date_rejected += 1
+                    date_rejected_total += 1
+                    stamp = str(row.get("posted_at", ""))
+                    if stamp not in returned_date_examples and len(returned_date_examples) < 5:
+                        returned_date_examples.append(stamp)
+                    continue
+                post_id = str(row.get("post_id", ""))
+                if not post_id or post_id in seen:
+                    duplicate_total += 1
+                    continue
+                seen.add(post_id)
+                row["rank"] = len(rows) + 1
+                rows.append(row)
+                added += 1
+                if limit > 0 and len(rows) >= limit:
+                    break
         print(f"  JSON页 {pages_used}/{max_pages}：新增 {added}，累计 {len(rows)}/{target_label}", flush=True)
         if checkpoint is not None:
             checkpoint(rows, {"query": query, "slice_start": start_date.isoformat() if start_date else "", "slice_end": end_date.isoformat() if end_date else "", "count": len(rows), "json_pages_used": pages_used, "last_cursor": cursor or "", "parsed_post_count": parsed_total, "date_rejected_count": date_rejected_total, "duplicate_or_missing_id_count": duplicate_total, "returned_date_examples": list(returned_date_examples), "search_engine": "graphql", "stop_reason": "in_progress", "coverage_status": "needs_retry", "search_end_evidence":{"policy":EMPTY_TAIL_POLICY,"responses":list(empty_tail_responses)}})
@@ -1493,14 +928,17 @@ def _collect_search_graphql_impl(page, keyword: str, keyword_index: int, limit: 
         if isinstance(remaining, (int, float)) and remaining <= 5 and isinstance(reset, (int, float)) and reset > time.time():
             pause = max(5.0, reset - time.time()) + random.uniform(5, 20)
             print(f"  [搜索响应头节奏] 当前额度剩余 {int(remaining)}，按 reset 暂停 {pause / 60:.1f} 分钟。", flush=True)
-            time.sleep(pause)
+            measured_sleep(pause, "rate_limit_sleep")
         else:
-            time.sleep(random.uniform(request_delay_min, request_delay_max))
-        next_response, trigger_attempt = _next_browser_signed_search_response(
-            page, query, pagination_trigger_attempts, pagination_trigger_timeout_ms, expected_cursor=cursor, buffered_responses=buffered_responses,
-        )
+            measured_sleep(random.uniform(request_delay_min, request_delay_max))
+        if transport is None:
+            next_response, trigger_attempt = _next_browser_signed_search_response(
+                page, query, pagination_trigger_attempts, pagination_trigger_timeout_ms, expected_cursor=cursor, buffered_responses=buffered_responses,
+            )
+        else:
+            next_response, trigger_attempt = transport.fetch(cursor), 1
         pagination_trigger_retries += max(0, trigger_attempt - 1)
-        if next_response is None and (empty_tail_responses or resume_record is not None):
+        if transport is None and next_response is None and (empty_tail_responses or resume_record is not None):
             print('[游标核验] 网页触发无响应；使用新浏览器签名核验同一游标，不把超时当结束或回退首页。', flush=True)
             next_response = _fresh_browser_cursor_response(page, query, cursor, buffered_responses)
         if next_response is None:
@@ -1550,7 +988,7 @@ def _collect_search_graphql_impl(page, keyword: str, keyword_index: int, limit: 
         "date_rejected_count": date_rejected_total,
         "duplicate_or_missing_id_count": duplicate_total,
         "returned_date_examples": returned_date_examples,
-        "request_transport": "browser_signed_network_json",
+        "request_transport": "browser_signed_network_json" if transport is None else "experimental_direct_http_json",
         "request_method": str(template.get("method", "GET")),
         "operation_name": operation_name,
         "endpoint_path": endpoint_path,

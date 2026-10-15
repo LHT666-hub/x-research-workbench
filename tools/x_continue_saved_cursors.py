@@ -5,10 +5,14 @@ import json
 import os
 import random
 import re
+import sqlite3
 import subprocess
 import time
 from datetime import date
 import x_keyword_collector as c
+from x_workbench.storage import SQLiteCheckpoint
+from x_workbench.metrics import StageTimings, timing_scope, current_timings, measure, measured_sleep
+from x_workbench.evidence import EvidenceCache, evidence_cache_scope
 from x_plan_cursor_continuation import read,local_day,manual_pause_verified
 from x_recovery_policy import POLICY_ID,may_verify_404,backoff_seconds,policy_receipt,protected_error,enabled_by_settings
 
@@ -25,7 +29,7 @@ def account_busy(node,run_id,session):
     return result.stdout.strip()
 
 def fatal(exc):
-    return isinstance(exc,(OSError,ValueError)) or bool(re.search(r'HTTP\s*(400|401|403|404)|登录|验证码|date_filter_mismatch|日期核验|查询/游标不匹配',str(exc),re.I))
+    return isinstance(exc,(OSError,ValueError,sqlite3.Error)) or bool(re.search(r'HTTP\s*(400|401|403|404)|登录|验证码|date_filter_mismatch|日期核验|查询/游标不匹配',str(exc),re.I))
 
 def verify_transient_404(page,record,out,cfg,on_state=None):
     """One bounded verification, not an unconditional retry or guard bypass."""
@@ -70,14 +74,14 @@ def verify_transient_404(page,record,out,cfg,on_state=None):
                 pause=backoff_seconds(exc,cfg,stage_attempt)
                 print(f'[404复核退避] {name} {exc}，等待{pause/60:.1f}分钟；不将429/超时当复核失败或采完。',flush=True)
                 if on_state:on_state('404_verification_cooldown',time.time()+pause)
-                time.sleep(pause)
+                measured_sleep(pause, "backoff_sleep")
                 if on_state:on_state('404_verifying',None)
     def wait(item):
         rate=item['rate_limit'];pause=random.uniform(cfg['graphql_delay_min'],cfg['graphql_delay_max'])
         if rate.get('remaining',999)<=5 and rate.get('reset',0)>time.time():
             pause=max(pause,rate['reset']-time.time()+random.uniform(5,20))
         if pause>cfg['graphql_delay_max'] and on_state:on_state('404_verification_cooldown',time.time()+pause)
-        time.sleep(pause)
+        measured_sleep(pause, "rate_limit_sleep" if rate.get("remaining",999)<=5 and rate.get("reset",0)>time.time() else "pacing_sleep")
         if on_state:on_state('404_verifying',None)
     url='https://x.com/search?q='+c.quote(query)+'&src=typed_query'+('&f=live' if cfg['search_type']=='live' else '')
     def first_response():
@@ -102,7 +106,7 @@ def verify_transient_404(page,record,out,cfg,on_state=None):
     c._write_json_atomic(proof_dir/'verification.json',proof)
     return rows,continuation,str((proof_dir/'verification.json').resolve())
 
-def main():
+def _main():
     p=argparse.ArgumentParser()
     p.add_argument('--account-node',choices=list('abcde'),required=True)
     p.add_argument('--run-id',required=True)
@@ -112,6 +116,7 @@ def main():
     p.add_argument('--pagination-trigger-attempts',type=int,default=3)
     p.add_argument('--pagination-trigger-timeout-ms',type=int,default=15000)
     p.add_argument('--verify-404-once',action='store_true',help='Explicitly authorized bounded verification; never ignore a 404')
+    p.add_argument('--checkpoint-backend',choices=['json','sqlite'],default='json',help='Opt-in incremental sidecar; legacy JSON remains the default')
     args=p.parse_args(); node=args.account_node
     settings_path=c.ROOT/'recovery_policy.json'
     args.verify_404_once=enabled_by_settings(settings_path,node) if settings_path.exists() else args.verify_404_once
@@ -140,28 +145,69 @@ def main():
     handle=os.open(lock,os.O_CREAT|os.O_EXCL|os.O_WRONLY)
     os.write(handle,str(os.getpid()).encode()); os.close(handle)
     path=out/'continuation_raw.json'
-    payload=json.loads(path.read_text(encoding='utf-8')) if path.exists() else {
-        'created_at':c.now_iso(),'account_node':node,'original_run_id':args.run_id,'plan_sha256':plan_sha,
-        'sources':plan['sources'],'posts':[],'search_runs':[],'guard_hold':None,'finalized':False,
-        'search_engine':'graphql','author_strategy':'deferred','repair_policy':'coverage_first',
-        'author_lookup_performed':False,'automation_resumed':False,'platform_all_posts_proven':False}
+    if args.checkpoint_backend=='json' and path.with_suffix('.sqlite3').exists():
+        lock.unlink(); raise RuntimeError('SQLite checkpoint exists; use --checkpoint-backend sqlite, never fall back to a possibly stale JSON snapshot')
+    store=None
+    try:
+        store=SQLiteCheckpoint(path) if args.checkpoint_backend=='sqlite' else None
+        loaded=store.load() if store else None
+        if loaded is not None:
+            payload=loaded
+        elif path.exists():
+            payload=json.loads(path.read_text(encoding='utf-8'))
+        else:
+            payload={
+                'created_at':c.now_iso(),'account_node':node,'original_run_id':args.run_id,'plan_sha256':plan_sha,
+                'sources':plan['sources'],'posts':[],'search_runs':[],'guard_hold':None,'finalized':False,
+                'search_engine':'graphql','author_strategy':'deferred','repair_policy':'coverage_first',
+                'author_lookup_performed':False,'automation_resumed':False,'platform_all_posts_proven':False}
+    except BaseException:
+        if store:store.close()
+        lock.unlink(missing_ok=True)
+        raise
     if payload['plan_sha256']!=plan_sha or payload.get('guard_hold'):
+        if store:store.close()
         lock.unlink(); raise RuntimeError('独立计划改变或存在新保护；禁止恢复')
     known.update(str(r.get('post_id') or r.get('post_url')) for r in payload['posts'])
     payload['recovery_policy']={**policy_receipt(node,args.verify_404_once),'activated_at':c.now_iso(),'worker_pid':os.getpid()}
-    def save():
-        payload['updated_at']=c.now_iso(); c._write_json_atomic(path,payload)
+    status_cache=EvidenceCache()
+    def save(force_snapshot=False):
+        payload['updated_at']=c.now_iso()
+        if store:
+            payload['checkpoint_backend']='sqlite'
+            store.commit(payload)
+            if force_snapshot or store.generation==1 or store.generation%20==0:
+                store.export_snapshot(payload)
+        else:
+            c._write_json_atomic(path,payload)
+        with evidence_cache_scope(status_cache), measure('status_build'):
+            verified_count=sum(c.search_end_verified(r) for r in payload['search_runs'])
         c._write_json_atomic(out/'status.json',{'updated_at':payload['updated_at'],'pid':os.getpid(),'account_node':node,
             'run_id':args.run_id,'active_phase':payload.get('active_phase'),'current_date':payload.get('current_date'),
             'current_progress':payload.get('current_progress'),'actual_new_posts':len(payload['posts']),
             'planned_days':len(plan['queue']),'attempted_days':len({r['slice_start'] for r in payload['search_runs']}),
-            'verified_continuation_ends':sum(c.search_end_verified(r) for r in payload['search_runs']),
+            'verified_continuation_ends':verified_count,
             'finalized':payload['finalized'],'guard_hold':payload.get('guard_hold'),
             'cooldown_until_epoch':payload.get('cooldown_until_epoch'),'original_data_written':False,
             'recovery_policy':payload.get('recovery_policy'),
+            'checkpoint_backend':args.checkpoint_backend,'checkpoint_generation':store.generation if store else None,
+            'authoritative_checkpoint':str(store.path.resolve()) if store else str(path.resolve()),
+            'json_snapshot_may_lag':bool(store),'stage_timings':current_timings().snapshot(),
             'prior_chain_verified':False,'natural_day_complete_proven':False,'platform_all_posts_proven':False})
-    payload['active_phase']='starting'; save()
+    payload['active_phase']='starting'
     try:
+        save()
+    except BaseException:
+        if store:store.close()
+        lock.unlink(missing_ok=True)
+        raise
+    try:
+        # A restart cannot shorten a previously persisted server/reset backoff.
+        remaining=max(0,float(payload.get('cooldown_until_epoch') or 0)-time.time())
+        if remaining:
+            payload['active_phase']='persisted_cooldown';save()
+            measured_sleep(remaining,'backoff_sleep')
+            payload.update(active_phase='starting',cooldown_until_epoch=None);save()
         with c.sync_playwright() as pw:
             context=pw.chromium.launch_persistent_context(str(session),headless=False,executable_path=str(c.CHROME),locale='en-US',viewport={'width':1400,'height':1000})
             try:
@@ -178,9 +224,9 @@ def main():
                         if sha!=receipt['sha256'] or not manual_pause_verified(node,c.Path(receipt['path']),now):
                             raise RuntimeError('历史源变化/新增保护，停止独立续采')
                     if processed:
-                        time.sleep(random.uniform(cfg['delay_min'],cfg['delay_max']))
+                        measured_sleep(random.uniform(cfg['delay_min'],cfg['delay_max']))
                     if processed and processed%cfg['break_every']==0:
-                        time.sleep(random.uniform(cfg['break_min'],cfg['break_max']))
+                        measured_sleep(random.uniform(cfg['break_min'],cfg['break_max']))
                     day=item['slice_start']; seed=list(baseline[day].values())
                     seed.extend(p for p in payload['posts'] if local_day(p)==day)
                     record=next((r for r in reversed(payload['search_runs']) if r.get('source_record_index')==item['source_record_index'] and r.get('source_path')==item['source_path']),None)
@@ -208,9 +254,10 @@ def main():
                                 no_growth_stop=cfg['no_growth_stop'],request_delay_min=cfg['graphql_delay_min'],request_delay_max=cfg['graphql_delay_max'],
                                 timezone_offset=cfg['timezone_offset'],pagination_trigger_attempts=3,pagination_trigger_timeout_ms=15000,
                                 checkpoint=checkpoint,resume_record=record,seed_rows=seed)
-                            record.update(coverage); record['completed_at']=c.now_iso(); save()
+                            record.update(coverage); record['completed_at']=c.now_iso(); save(force_snapshot=True)
                             if record.get('date_rejected_count'): raise RuntimeError('date_filter_mismatch；停止核验')
-                            print(f"[续采结算] {day} {coverage['state_code']} 新增{record['new_saved_posts']}；只声明本次游标链末端，不补证旧页链。",flush=True)
+                            end_label='已核验本次游标链末端' if c.search_end_verified(record) else '尚未核验末端'
+                            print(f"[续采结算] {day} {coverage['state_code']} 新增{record['new_saved_posts']}；{end_label}，不补证旧页链。",flush=True)
                             break
                         except Exception as exc:
                             record['retry_history'].append({'at':c.now_iso(),'error':f'{type(exc).__name__}: {exc}',
@@ -223,7 +270,7 @@ def main():
                                 pause=backoff_seconds(exc,cfg)
                                 payload.update(guard_hold=held,active_phase='404_verification_cooldown',cooldown_until_epoch=time.time()+pause);save()
                                 print(f'[404受限复核] 保留保护，按原退避等待{pause/60:.1f}分钟；仅核验同查询/保存游标/保存页控制组，每日期一次。',flush=True)
-                                time.sleep(pause)
+                                measured_sleep(pause, "backoff_sleep")
                                 payload['active_phase']='404_verifying';save()
                                 def recovery_state(phase,until):
                                     payload.update(active_phase=phase,cooldown_until_epoch=until);save()
@@ -255,7 +302,7 @@ def main():
                             pause=max(random.uniform(cfg['backoff_min'],cfg['backoff_max'])*(attempt+1),
                                       (getattr(exc,'retry_after',None) or getattr(exc,'search_retry_after',0) or 0)+random.uniform(10,45))
                             payload.update(active_phase='cooldown',cooldown_until_epoch=time.time()+pause); save()
-                            print(f'[退避] {exc}；等待{pause/60:.1f}分钟，仅续最后已保存游标。',flush=True); time.sleep(pause)
+                            print(f'[退避] {exc}；等待{pause/60:.1f}分钟，仅续最后已保存游标。',flush=True); measured_sleep(pause, "backoff_sleep")
                             if attempt>=cfg['retry_limit']:
                                 record.update(stop_reason='interrupted_with_saved_sample',interruption_error=str(exc),completed_at=c.now_iso())
                                 save(); break
@@ -281,9 +328,20 @@ def main():
                        guard_hold={'at':c.now_iso(),'error':f'{type(exc).__name__}: {exc}','reason':'independent_continuation_requires_review'})
         print(f'[保护停止] {exc}',flush=True)
     finally:
-        save(); lock.unlink(missing_ok=True)
-        if payload['posts']:
-            from x_export_column_txt import export_rows
-            export_rows(payload['posts'],node.upper(),out/f'{node.upper()}_continuation_new_posts.txt')
+        try:
+            save(force_snapshot=True)
+            if payload['posts']:
+                from x_export_column_txt import export_rows
+                with measure('export'):
+                    export_rows(payload['posts'],node.upper(),out/f'{node.upper()}_continuation_new_posts.txt')
+            c._write_json_atomic(out/'timings.json',current_timings().snapshot())
+        finally:
+            if store:store.close()
+            lock.unlink(missing_ok=True)
+
+
+def main():
+    with timing_scope(StageTimings()):
+        return _main()
 
 if __name__=='__main__': main()

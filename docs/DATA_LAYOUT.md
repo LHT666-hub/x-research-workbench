@@ -28,4 +28,6 @@
 
 TXT为UTF-8 BOM、制表符分栏，一条帖子一行；正文换行转义为`\n`。用Excel导入时选UTF-8和制表符，长帖子ID按文本处理。JSON是原始结构化主数据，TXT是阅读/分析导出，不是恢复检查点。
 
+2026-10-15新增可选存储：只有显式以`--checkpoint-backend sqlite`启动独立续采时，`continuation_raw.sqlite3`才是该续采的权威检查点，原JSON变成可能滞后的兼容快照；`status.json`会明确标注。现有五批没有执行转换。用`tools/x_read_checkpoint.py <continuation_raw.json>`读取权威状态；旧直接读取JSON的统计脚本不能当作SQLite模式的实时台账。WAL备份、哈希锚点及保护规则见[模块与存储说明](MODULAR_ARCHITECTURE.md)。
+
 移动证据文件会改变其绝对路径；结束判定需要重新关联并校验SHA256。现在不搬迁原始数据或浏览器目录，避免破坏断点和证据关联。

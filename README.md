@@ -1,6 +1,6 @@
 # X Research Workbench
 
-本地 X/Twitter 科研采集工具。**2026-10-13整理的源码版本**：真实 SearchTimeline 响应、精确日期区间、原子检查点、游标续采、原始响应证据及受限404复核。
+本地 X/Twitter 科研采集工具。**2026-10-15模块化第一阶段**：真实 SearchTimeline 响应、精确日期区间、原子检查点、游标续采、原始响应证据及受限404复核；新增组件拆分、阶段计时和可选增量检查点。
 
 这个仓库只发布代码、测试和说明。**没有你的帖子数据、Cookie、浏览器登录目录或采集断点**；克隆仓库不会把旧任务或账号带到新电脑。
 
@@ -8,9 +8,11 @@
 
 |用途|文件|说明|
 |---|---|---|
-|核心爬虫|[tools/x_keyword_collector.py](tools/x_keyword_collector.py)|查询构造、响应匹配、解析、翻页、逐页保存、统一结束判定|
+|核心协调/兼容入口|[tools/x_keyword_collector.py](tools/x_keyword_collector.py)|保持旧CLI/import兼容，组织分页和既有功能|
+|模块地图|[docs/MODULAR_ARCHITECTURE.md](docs/MODULAR_ARCHITECTURE.md)|查询、解析、政策、传输、存储、证据缓存和计时已拆入tools/x_workbench/|
 |网页工作台|[tools/x_keyword_ui.py](tools/x_keyword_ui.py)|账号管理、采集设置、任务查看和导出；不是底层爬虫|
 |独立断点续采|[tools/x_continue_saved_cursors.py](tools/x_continue_saved_cursors.py)|核验计划和源文件，从已保存cursor继续；与普通工作台任务分开|
+|只读检查点查看|[tools/x_read_checkpoint.py](tools/x_read_checkpoint.py)|识别权威SQLite或旧JSON，不启动浏览器/采集|
 |404统一规则|[tools/x_recovery_policy.py](tools/x_recovery_policy.py)|有限复核、退避、保护条件；[规则说明](RECOVERY_RULES.md)|
 |搜索末端分类|[SEARCH_STATUS_RULES.md](SEARCH_STATUS_RULES.md)|哪些是本次查询末端，哪些只是超时、异常或人工暂停|
 |TXT导出|[tools/x_export_column_txt.py](tools/x_export_column_txt.py)|UTF-8、制表符分栏；当前main绑定历史五批，通用导出函数为export_rows|
@@ -35,6 +37,15 @@ py -3 -m venv .venv
 
 当前研究方案参数为 `graphql / deferred / pagination_trigger_attempts=3 / pagination_trigger_timeout_ms=15000 / coverage_first`。正文是否含关键词与搜索返回是否相关是不同指标；不能只用“搜到了”证明正文命中。作者所在地补全是单独功能，默认研究方案不补查作者位置。
 
+## 本次改造的边界
+
+- **默认仍为浏览器签名路线，仍用cursor翻页**；没有恢复任何研究任务、迁移账号或修改旧采集数据。
+- 新增`timings.json`，区分请求等待、解析、保存、证据核验与合法冷却；嵌套阶段不可直接相加当总耗时。
+- 实时状态可缓存已核验证据；最终结束验收仍重新读取实际证据并检查SHA256，不放宽“到底”政策。
+- 独立续采增加可选`--checkpoint-backend sqlite`，帖子和cursor同事务增量提交；默认JSON不变。启用后SQLite为权威、JSON快照可能滞后，旧JSON报表不能当实时数据，先看[兼容与恢复说明](docs/MODULAR_ARCHITECTURE.md)。不是对旧五批的自动转换。
+- 直接HTTP实验接口已与同一分页/结束政策连接，**默认禁止请求，未接入正式UI/CLI，尚未完成真实签名/会话与速度验证**。不是安装后便自动无浏览器；不直接接入twscrape、不轮换账号、不绕限流。
+- `tools/x_offline_checkpoint_benchmark.py`仅用临时合成数据测试存储，不登录、不请求X，不能作为实网倍速证明。
+
 ## 什么才叫搜索到底
 
 - `response_end`：当前精确查询成功响应、query/cursor匹配，有效timeline没有下一Bottom游标，且原始响应证据完整。
@@ -50,7 +61,7 @@ py -3 -m venv .venv
 ## 测试与版本
 
 ```powershell
-.venv\Scripts\python.exe -m pytest tests/test_x_keyword_collector.py tests/test_x_keyword_ui.py tests/test_x_search_empty_tail.py tests/test_x_cursor_continuation.py tests/test_x_404_recovery.py tests/test_x_bounded_404_retry.py tests/test_x_recovery_policy_v2.py tests/test_x_guard_audit.py -q
+.venv\Scripts\python.exe -m pytest tests/test_x_workbench_components.py tests/test_x_keyword_collector.py tests/test_x_keyword_ui.py tests/test_x_search_empty_tail.py tests/test_x_cursor_continuation.py tests/test_x_404_recovery.py tests/test_x_bounded_404_retry.py tests/test_x_recovery_policy_v2.py tests/test_x_guard_audit.py -q
 ```
 
 浏览器/HTTP交接实验另有可选依赖，不混入日常安装。源码来源与SHA256清单见 [SOURCE_SNAPSHOT.json](SOURCE_SNAPSHOT.json)。旧版本通过Git历史查询，不需要另建“新版/最终版/最终最终版”源码目录。

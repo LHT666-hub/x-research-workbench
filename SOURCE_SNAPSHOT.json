@@ -1,5 +1,5 @@
 {
-  "snapshot_date": "2026-10-13",
+  "snapshot_date": "2026-10-15",
   "source_root": "project",
   "release_mirror": "x-research-workbench",
   "research_data_uploaded": false,
@@ -9,7 +9,7 @@
     {
       "path": "tools/x_keyword_collector.py",
       "source": "project/tools/x_keyword_collector.py",
-      "sha256": "5b7a92811b69e1c0a4f784b7123404f44cc998739517152f29b1568135660c56"
+      "sha256": "9469f6e1cd5807b10b34151c8fd4714d6d47f5b9b241022c26a6ab438e7870bb"
     },
     {
       "path": "tools/x_keyword_ui.py",
@@ -34,7 +34,7 @@
     {
       "path": "tools/x_continue_saved_cursors.py",
       "source": "project/tools/x_continue_saved_cursors.py",
-      "sha256": "8e6828207a2fbae3f0a2385a3e299181c0d58bf6327413c9dd4bcb85ccbbe6b8"
+      "sha256": "f4b74841007024e28423fbae9038e49580a897c28b1cf6ef990809446e2a4f0a"
     },
     {
       "path": "tools/x_recovery_policy.py",
@@ -115,6 +115,82 @@
       "path": "tools/x_record_experiment_tails.py",
       "source": "project/tools/x_record_experiment_tails.py",
       "sha256": "c1f76ea03f8b09c921c52b728bddbc080c29440034c2c44e27e97867bd7c56bd"
+    },
+    {
+      "path": "tools/x_read_checkpoint.py",
+      "source": "project/tools/x_read_checkpoint.py",
+      "sha256": "e4ce814563d8713350dacfdf6ac1c09931e46341b4b6df4f0273776f510de9f0"
+    },
+    {
+      "path": "tools/x_offline_checkpoint_benchmark.py",
+      "source": "project/tools/x_offline_checkpoint_benchmark.py",
+      "sha256": "26d7e8412d54067252b78645d86afe60fcafd56e87d425ee400c01d56596b3c1"
+    },
+    {
+      "path": "tests/test_x_workbench_components.py",
+      "source": "project/tests/test_x_workbench_components.py",
+      "sha256": "9cad980c4cc8b4e79abaae4435c82618f91c6384e132ab420deb08404889d405"
+    },
+    {
+      "path": "docs/MODULAR_ARCHITECTURE.md",
+      "source": "project/docs/MODULAR_ARCHITECTURE.md",
+      "sha256": "46d8c44e584967739307b905161c8737275925ee50ac984d84157da1963e6d3a"
+    },
+    {
+      "path": "tools/x_workbench/__init__.py",
+      "source": "project/tools/x_workbench/__init__.py",
+      "sha256": "b7c829d9c47012fff365f11e4e3c0891c34f5ffbaf2719c2d38e784c7c044351"
+    },
+    {
+      "path": "tools/x_workbench/browser.py",
+      "source": "project/tools/x_workbench/browser.py",
+      "sha256": "9a4c0ed7c62967238fd97e68bd736d71ae476bed2fdf7b9974f36c34142deadd"
+    },
+    {
+      "path": "tools/x_workbench/clock.py",
+      "source": "project/tools/x_workbench/clock.py",
+      "sha256": "4f99132df1e07738b8a799dbbc64c79f084115bf6325a51b796d76dfc4a11587"
+    },
+    {
+      "path": "tools/x_workbench/evidence.py",
+      "source": "project/tools/x_workbench/evidence.py",
+      "sha256": "8a5a9b0539ef9b02c53fd0c0ba32a40269b9ed0a393b0ed11ea45961227ad7fb"
+    },
+    {
+      "path": "tools/x_workbench/http_transport.py",
+      "source": "project/tools/x_workbench/http_transport.py",
+      "sha256": "8ee31be0300b2c5bd51bf2f91a8e6d649401216c7d3b92b0075d6ff70c52b952"
+    },
+    {
+      "path": "tools/x_workbench/metrics.py",
+      "source": "project/tools/x_workbench/metrics.py",
+      "sha256": "d5a6aa895c39523d885959b3680c8aa9c8c514b384074aa40b6c721a0dc60936"
+    },
+    {
+      "path": "tools/x_workbench/parsing.py",
+      "source": "project/tools/x_workbench/parsing.py",
+      "sha256": "45e72d6676e28eaaa527cc9afc7f2ef678ab976fc11974e70b1e93946de3f997"
+    },
+    {
+      "path": "tools/x_workbench/policy.py",
+      "source": "project/tools/x_workbench/policy.py",
+      "sha256": "5d02c892a386240fc6b86a48bed162f5263bf85776e361ad24281b0efbae63b5"
+    },
+    {
+      "path": "tools/x_workbench/query.py",
+      "source": "project/tools/x_workbench/query.py",
+      "sha256": "6434bd342feafec7cd6538a629820676b57bfde3752464a0dd3beb1578762d64"
+    },
+    {
+      "path": "tools/x_workbench/request_identity.py",
+      "source": "project/tools/x_workbench/request_identity.py",
+      "sha256": "31623079fdf1964932110ff61073b6eb0d53d83de1919cebfd149eb67050d14d"
+    },
+    {
+      "path": "tools/x_workbench/storage.py",
+      "source": "project/tools/x_workbench/storage.py",
+      "sha256": "f4eda8abbf12a168e3105c273f88377e99514aa690534761c47d7a26397933bf"
     }
-  ]
+  ],
+  "revision_notes": "Modularization phase 1; optional SQLite checkpoints; status-only evidence cache; stage timings; HTTP experimental boundary, no real account/speed validation or production transport switch."
 }
