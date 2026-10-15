@@ -1,6 +1,6 @@
 # X Research Workbench
 
-本地 X/Twitter 科研采集工具。**2026-10-15模块化第一阶段**：真实 SearchTimeline 响应、精确日期区间、原子检查点、游标续采、原始响应证据及受限404复核；新增组件拆分、阶段计时和可选增量检查点。
+本地 X/Twitter 科研采集工具。**2026-10-15模块化与权威检查点整合（0.3.0）**：真实 SearchTimeline 响应、精确日期区间、原子检查点、游标续采、原始响应证据及受限404复核；组件拆分、阶段计时、可选增量检查点和统一读取。
 
 这个仓库只发布代码、测试和说明。**没有你的帖子数据、Cookie、浏览器登录目录或采集断点**；克隆仓库不会把旧任务或账号带到新电脑。
 
@@ -15,7 +15,8 @@
 |只读检查点查看|[tools/x_read_checkpoint.py](tools/x_read_checkpoint.py)|识别权威SQLite或旧JSON，不启动浏览器/采集|
 |404统一规则|[tools/x_recovery_policy.py](tools/x_recovery_policy.py)|有限复核、退避、保护条件；[规则说明](RECOVERY_RULES.md)|
 |搜索末端分类|[SEARCH_STATUS_RULES.md](SEARCH_STATUS_RULES.md)|哪些是本次查询末端，哪些只是超时、异常或人工暂停|
-|TXT导出|[tools/x_export_column_txt.py](tools/x_export_column_txt.py)|UTF-8、制表符分栏；当前main绑定历史五批，通用导出函数为export_rows|
+|TXT导出|[tools/x_export_column_txt.py](tools/x_export_column_txt.py)|UTF-8、制表符分栏；main绑定历史五批，export_checkpoint读取权威版本并生成回执|
+|独立续采审计|[tools/x_audit_continuations.py](tools/x_audit_continuations.py)|同时核对数据库/JSON、结束证据、计划与真实进程；只读|
 |数据保存位置|[docs/DATA_LAYOUT.md](docs/DATA_LAYOUT.md)|原始批次、补采、续采、导出、证据不能混为一个文件|
 |历史/实验代码|[docs/EXPERIMENTS.md](docs/EXPERIMENTS.md)|历史脚本的适用范围；不作为日常启动入口|
 
@@ -39,10 +40,11 @@ py -3 -m venv .venv
 
 ## 本次改造的边界
 
-- **默认仍为浏览器签名路线，仍用cursor翻页**；没有恢复任何研究任务、迁移账号或修改旧采集数据。
+- **默认仍为浏览器签名路线，仍用cursor翻页**；安装或更新代码不会自动恢复任务、迁移账号或转换旧数据。研究任务恢复须另行明确授权并通过检查。
 - 新增`timings.json`，区分请求等待、解析、保存、证据核验与合法冷却；嵌套阶段不可直接相加当总耗时。
 - 实时状态可缓存已核验证据；最终结束验收仍重新读取实际证据并检查SHA256，不放宽“到底”政策。
-- 独立续采增加可选`--checkpoint-backend sqlite`，帖子和cursor同事务增量提交；默认JSON不变。启用后SQLite为权威、JSON快照可能滞后，旧JSON报表不能当实时数据，先看[兼容与恢复说明](docs/MODULAR_ARCHITECTURE.md)。不是对旧五批的自动转换。
+- 独立续采支持可选`--checkpoint-backend sqlite`，帖子和cursor同事务增量提交；CLI默认JSON不变。启用后SQLite为权威、JSON快照可能滞后。当前工作台、续采审计与TXT导出通过统一入口读取，返回版本号；数据库异常会明确报错，不退回旧JSON伪装最新。历史维护脚本仍须先核兼容性，见[兼容与恢复说明](docs/MODULAR_ARCHITECTURE.md)。不是对旧五批的自动转换。
+- 工作台新增独立续采只读面板，展示实际新增数、当前日期/页码、证据核验末端数和真实worker；原任务按钮不控制独立worker。每次TXT导出记录来源版本、行数和文件哈希，不把续采新增数当历史合计。
 - 直接HTTP实验接口已与同一分页/结束政策连接，**默认禁止请求，未接入正式UI/CLI，尚未完成真实签名/会话与速度验证**。不是安装后便自动无浏览器；不直接接入twscrape、不轮换账号、不绕限流。
 - `tools/x_offline_checkpoint_benchmark.py`仅用临时合成数据测试存储，不登录、不请求X，不能作为实网倍速证明。
 - 第二轮减少了逐页全列表扫描/复制、按日期反复全量筛选、同页证据重复落盘、首响应重复解析及队列重复构造；搜索前仅阶段变化时不重建CSV/HTML/ZIP。新增独占耗时`self_seconds`，避免嵌套计时造成误读。这些不降低限流等待，不放宽证据核验。
@@ -63,6 +65,7 @@ py -3 -m venv .venv
 
 ```powershell
 .venv\Scripts\python.exe -m pytest tests/test_x_efficiency_regressions.py tests/test_x_workbench_components.py tests/test_x_keyword_collector.py tests/test_x_keyword_ui.py tests/test_x_search_empty_tail.py tests/test_x_cursor_continuation.py tests/test_x_404_recovery.py tests/test_x_bounded_404_retry.py tests/test_x_recovery_policy_v2.py tests/test_x_guard_audit.py -q
+.venv\Scripts\python.exe -m pytest tests/test_x_authoritative_readers.py tests/test_x_verified_resume.py -q
 ```
 
 浏览器/HTTP交接实验另有可选依赖，不混入日常安装。源码来源与SHA256清单见 [SOURCE_SNAPSHOT.json](SOURCE_SNAPSHOT.json)。旧版本通过Git历史查询，不需要另建“新版/最终版/最终最终版”源码目录。

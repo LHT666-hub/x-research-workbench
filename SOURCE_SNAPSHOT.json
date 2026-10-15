@@ -14,7 +14,7 @@
     {
       "path": "tools/x_keyword_ui.py",
       "source": "project/tools/x_keyword_ui.py",
-      "sha256": "7a4d92f9b95d6415d32ab4efefbddf0cf6bdba44a9ac49c2fafcc237169d9e5a"
+      "sha256": "0ed4aa42637a8eaa4ed08d051f5eaca68287634bce3c0d6a8c4116f7fbda927a"
     },
     {
       "path": "tools/x_account_collector.py",
@@ -49,17 +49,17 @@
     {
       "path": "tools/x_export_column_txt.py",
       "source": "project/tools/x_export_column_txt.py",
-      "sha256": "f9053d14a533b5497102b1d2e4d0210627f81ad10a7918af1c7001783423b15a"
+      "sha256": "3b0ec43bdb9eb2955201810988361a2c45e850e67715f85ba25ec381088baba8"
     },
     {
       "path": "tools/x_guard_audit.py",
       "source": "project/tools/x_guard_audit.py",
-      "sha256": "1b379ca8f0893cf84044fa58d041a1261750aaf4c0df291ecaac8dac1476be60"
+      "sha256": "1998697212740b01ec08fe5b7f31ab0b411722be29c80d3622375f9d1898b3d7"
     },
     {
       "path": "tools/x_snapshot_cursor_continuation.py",
       "source": "project/tools/x_snapshot_cursor_continuation.py",
-      "sha256": "b13fb21aa75b30fcb7cc6fa23051f13c846018da2379770027ab02eaab3cc84d"
+      "sha256": "be24cfb30edd27c8924577b518e3ff684b45c7a21a4b1cc6a4c0fc65ae9716f3"
     },
     {
       "path": "tools/x_probe_continuation_404.py",
@@ -134,12 +134,12 @@
     {
       "path": "docs/MODULAR_ARCHITECTURE.md",
       "source": "project/docs/MODULAR_ARCHITECTURE.md",
-      "sha256": "010bdad47729fa107ff9c36be90b2c6ad80e6e8807889e87a527d4811eab6ac0"
+      "sha256": "46c3e0fe0d76d21bc4afedc8a8f44fd22fda417a13e8abbfe8931b7b00abce2d"
     },
     {
       "path": "tools/x_workbench/__init__.py",
       "source": "project/tools/x_workbench/__init__.py",
-      "sha256": "c541b6bae0dc46a779cd56f63fc4d2c91f1b9fdea797eaffbdb70e93ec0f4aab"
+      "sha256": "2684728846ce269aff41d0c0b3216e8fcd58e50a596829bcb4c894e45fb33518"
     },
     {
       "path": "tools/x_workbench/browser.py",
@@ -189,7 +189,7 @@
     {
       "path": "tools/x_workbench/storage.py",
       "source": "project/tools/x_workbench/storage.py",
-      "sha256": "69ca4de2779615358f4a42af8716efbf9daa71de7d6883f995c9fce8cb249b7c"
+      "sha256": "aa54b3714de266ba8bae9dbd6994b30edfba434e1fbd292d5fca3bb3d6a595bf"
     },
     {
       "path": "tools/x_workbench/progress.py",
@@ -200,6 +200,41 @@
       "path": "tests/test_x_efficiency_regressions.py",
       "source": "project/tests/test_x_efficiency_regressions.py",
       "sha256": "c426fb0efbe4cb4201d0e31b89760eda69df836d4696cac619343bb94eea25bd"
+    },
+    {
+      "path": "tools/x_workbench/state.py",
+      "source": "project/tools/x_workbench/state.py",
+      "sha256": "fab90666499796091bd0ab804527152f6523587dd48fe2f00a1ed10b7ebcfc61"
+    },
+    {
+      "path": "tools/x_workbench/continuation_view.py",
+      "source": "project/tools/x_workbench/continuation_view.py",
+      "sha256": "76b3863c8d156db3207ed183b752806d4470edc326b6d72b69046a96bb28eb24"
+    },
+    {
+      "path": "tools/x_workbench/resume.py",
+      "source": "project/tools/x_workbench/resume.py",
+      "sha256": "93efb43d2ce48892c93efc32e7fa898edfd294a92a721af7ff7095764d9e55e9"
+    },
+    {
+      "path": "tools/x_resume_verified_five.py",
+      "source": "project/tools/x_resume_verified_five.py",
+      "sha256": "1ec6adcd591b8a4c7c1947179426d692df48f12066edcd5ced41ce6524300f07"
+    },
+    {
+      "path": "tools/x_audit_continuations.py",
+      "source": "project/tools/x_audit_continuations.py",
+      "sha256": "287afa65c67ff1ecff29390b174ecc81439032ff2eb08626ff0000d19f74c2f1"
+    },
+    {
+      "path": "tests/test_x_authoritative_readers.py",
+      "source": "project/tests/test_x_authoritative_readers.py",
+      "sha256": "f4f7e9090b0505ca89f28e0fa631cd70a1de78f4bcdef383ca19b7fcbb0bfb4e"
+    },
+    {
+      "path": "tests/test_x_verified_resume.py",
+      "source": "project/tests/test_x_verified_resume.py",
+      "sha256": "8fa29ebd8f573407b9895c2e4c8af340c5881f4c1977ef0fc0be7c763d09cdff"
     }
   ],
   "revision_notes": "Modularization and efficiency phase 2: append-only checkpoint deltas/day index, response archive reuse, single initial parse, queue reuse, exclusive stage timing. SQLite remains opt-in; no real-account HTTP speed validation or production transport switch."

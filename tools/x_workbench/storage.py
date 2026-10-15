@@ -79,17 +79,17 @@ class SQLiteCheckpoint:
             self.connection.close()
             raise
 
-    def load(self):
+    def load(self, *, preview_limit=None, digest_cache=None):
         # A live writer may commit concurrently. Read metadata and posts from
         # the same WAL snapshot, never combine cursor N with rows N+1.
         self.connection.execute("BEGIN")
         try:
-            return self._load_snapshot()
+            return self._load_snapshot(preview_limit=preview_limit, digest_cache=digest_cache)
         finally:
             self.connection.rollback()
 
-    def _load_snapshot(self):
-        row = self.connection.execute("SELECT state,snapshot_sha,post_count FROM checkpoint WHERE id=1").fetchone()
+    def _load_snapshot(self, *, preview_limit=None, digest_cache=None):
+        row = self.connection.execute("SELECT state,snapshot_sha,post_count,generation FROM checkpoint WHERE id=1").fetchone()
         if row is None:
             return None
         state = json.loads(row[0])
@@ -98,11 +98,20 @@ class SQLiteCheckpoint:
             raise ValueError("Checkpoint row count/ordinal inconsistency")
         # Manual JSON guard edits must not be silently bypassed by the sidecar.
         if row[1]:
-            if not self.snapshot_path.exists() or hashlib.sha256(self.snapshot_path.read_bytes()).hexdigest() != row[1]:
+            digest = digest_cache.digest(self.snapshot_path) if digest_cache is not None and self.snapshot_path.exists() else hashlib.sha256(self.snapshot_path.read_bytes()).hexdigest() if self.snapshot_path.exists() else None
+            if digest != row[1]:
                 raise ValueError("Compatibility snapshot changed; review before SQLite resume")
         elif self.snapshot_path.exists():
             raise ValueError("Unanchored compatibility snapshot; review required")
-        state["posts"] = [json.loads(record[0]) for record in self.connection.execute("SELECT body FROM posts ORDER BY ordinal")]
+        self.loaded_post_count, self.loaded_generation = row[2], row[3]
+        if preview_limit is None:
+            records = self.connection.execute("SELECT body FROM posts ORDER BY ordinal")
+            state["posts"] = [json.loads(record[0]) for record in records]
+        elif preview_limit == 0:
+            state["posts"] = []
+        else:
+            records = self.connection.execute("SELECT body FROM posts ORDER BY ordinal DESC LIMIT ?", (preview_limit,))
+            state["posts"] = list(reversed([json.loads(record[0]) for record in records]))
         return state
 
     def commit(self, payload):
@@ -141,13 +150,5 @@ class SQLiteCheckpoint:
 
 def load_continuation_state(path):
     """Read authoritative sidecar if present, otherwise legacy JSON; no network."""
-    path = Path(path).resolve()
-    if path.with_suffix(".sqlite3").exists():
-        store = SQLiteCheckpoint(path, read_only=True)
-        try:
-            state = store.load()
-            if state is not None:
-                return state
-        finally:
-            store.close()
-    return json.loads(path.read_text(encoding="utf-8"))
+    from .state import read_state
+    return read_state(path).state

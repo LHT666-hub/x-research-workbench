@@ -4,6 +4,7 @@ import json
 import subprocess
 import x_keyword_collector as c
 from x_plan_cursor_continuation import OUT
+from x_workbench.state import read_state
 
 def main():
     progress=[]; unchanged=[]
@@ -14,7 +15,11 @@ def main():
     for node in 'abcde':
         plan=json.loads((OUT/node/'continuation_plan.json').read_text(encoding='utf-8'))
         status=json.loads((OUT/node/'collection/status.json').read_text(encoding='utf-8'))
-        raw=json.loads((OUT/node/'collection/continuation_raw.json').read_text(encoding='utf-8'))
+        snapshot=read_state(OUT/node/'collection/continuation_raw.json')
+        raw=snapshot.state
+        status.update(actual_new_posts=snapshot.post_count,active_phase=raw.get('active_phase'),
+                      current_date=raw.get('current_date'),current_progress=raw.get('current_progress'),
+                      guard_hold=raw.get('guard_hold'),finalized=raw.get('finalized'),checkpoint_snapshot=snapshot.receipt())
         # Worker can checkpoint between reads: don't mislabel a benign race.
         status['snapshot_posts_read']=len(raw['posts'])
         status['worker_alive']=any(p['ProcessId']==status['pid'] for p in processes)
@@ -29,7 +34,7 @@ def main():
         progress.append(status)
     assert all(x['unchanged'] for x in unchanged)
     snapshot={'captured_at':c.now_iso(),'progress':progress,'source_checks':unchanged,
-              'all_original_sources_unchanged':True,'automation_resumed':False,'tests_passed':101}
+              'all_original_sources_unchanged':True,'automation_resumed':False,'tests_not_run_by_this_snapshot':True}
     c._write_json_atomic(OUT/'launch_verification.json',snapshot)
     rows=[]
     for p in progress:

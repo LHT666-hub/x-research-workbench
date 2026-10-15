@@ -7,6 +7,7 @@ import json
 import mimetypes
 import os
 import signal
+import sqlite3
 import subprocess
 import threading
 import time
@@ -17,12 +18,15 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from x_workbench.state import read_state, STATE_NAMES
+from x_workbench.continuation_view import continuation_view, plan_paths, audit_continuations, worker_observations
 
 
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 COLLECTOR = ROOT / "tools" / "x_keyword_collector.py"
 OUTPUT_ROOT = ROOT / "outputs" / "x_keyword_runs"
+CONTINUATION_ROOT = ROOT / "outputs" / "cursor_continuation_20261012"
 MAX_KEYWORDS = 500
 ACCOUNT_CONFIG_PATH = ROOT / "tmp" / "x-account-nodes.json"
 DEFAULT_ACCOUNT_LABELS = {
@@ -233,8 +237,8 @@ def history_rows() -> list[dict[str, Any]]:
             "is_running": is_running,
             "keywords": keywords,
             "keyword_count": len(keywords) or int(config.get("keyword_count", 0) or 0),
-            "post_count": int(status.get("post_count", 0) or 0),
-            "resolved_authors": int(status.get("resolved_authors", 0) or 0),
+            "post_count": len(posts),
+            "resolved_authors": sum(isinstance(author,dict) and author.get('status')!='pending' for author in authors_map.values()),
             "unique_authors": unique_authors,
             "known_locations": known_locations,
             "profile_locations": profile_locations,
@@ -271,7 +275,9 @@ def cumulative_posts() -> list[dict[str, object]]:
     merged: dict[str, dict[str, object]] = {}
     keyword_lists: dict[str, list[str]] = {}
     for run in reversed(history_rows()):
-        dataset = read_json(run_directory(str(run["run_id"])) / "research_dataset.json", [])
+        import x_keyword_collector as collector
+        raw = read_json(run_directory(str(run["run_id"])) / "raw.json", {})
+        dataset = collector.deduplicate_posts(raw.get("posts", []))
         if not isinstance(dataset, list):
             continue
         for index, item in enumerate(dataset):
@@ -315,6 +321,8 @@ def run_details(run_id: str) -> dict[str, Any]:
     status = status if isinstance(status, dict) else {}
     raw = raw if isinstance(raw, dict) else {}
     posts = [row for row in raw.get("posts", []) if isinstance(row, dict)]
+    status={**status,'post_count':len(posts),'finalized':bool(raw.get('finalized')),
+            'active_phase':raw.get('active_phase'),'guard_hold':raw.get('guard_hold'),'updated_at':raw.get('updated_at')}
     authors_map = raw.get("authors", {})
     authors_map = authors_map if isinstance(authors_map, dict) else {}
     authors = [row for row in authors_map.values() if isinstance(row, dict)]
@@ -448,7 +456,16 @@ PAGE = PAGE.replace("任务已完成", "采集任务已结束（不等于各日�
 PAGE=PAGE.replace('帖子采集完成，所在地补全队列已保存','采样任务结束，作者队列已保留（到底状态见各日期）')
 
 
+CONTINUATION_PANEL = r'''<section class="panel" id="continuationSection"><h2>独立游标续采 · 最新存档</h2><p>这里显示本轮续采新增，不是原始历史总量。只读查看；上方原任务按钮不控制这些独立任务。数据库存档优先，旧JSON快照不会冒充最新进度。</p><button class="secondary" id="refreshContinuations">刷新续采</button><div id="continuationSummary">读取中…</div><div class="detail-table"><table><thead><tr><th>账号/词</th><th>当前日期/页</th><th>本轮实际新增</th><th>已核验续采末端/计划</th><th>进程/阶段</th><th>查看/导出</th></tr></thead><tbody id="continuationRows"></tbody></table></div><pre id="continuationDetail" style="white-space:pre-wrap"></pre></section>'''
+CONTINUATION_SCRIPT = r'''<script>(()=>{let busy=false,token=0;const by=id=>document.getElementById(id);const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));async function reload(){if(busy)return;busy=true;try{const response=await fetch('/api/continuations');const data=await response.json();if(!response.ok)throw Error(data.error||'读取失败');by('continuationSummary').textContent='按每次请求的已提交快照统计；采集继续时，后续导出可能是更新版本。';by('continuationRows').innerHTML=data.accounts.map(r=>`<tr><td>${esc(r.account_node.toUpperCase())} / ${esc(r.keywords.join('、'))}</td><td>${esc(r.current_date||'—')} / ${esc((r.current_progress||{}).page??'—')}</td><td>${r.actual_new_posts}</td><td>${r.verified_continuation_ends}/${r.planned_days}<br>不是自然日全量证明</td><td>${r.worker_alive?'运行':'已停止'} / ${esc(r.active_phase)}${r.guard_hold?'<br>保护中':''}</td><td><button data-node="${esc(r.account_node)}">详情</button> <a href="/api/continuation/export?node=${esc(r.account_node)}">分栏TXT（本轮新增）</a><br>${esc(r.snapshot.backend)} · ${esc(r.snapshot.revision)}</td></tr>`).join('')||'<tr><td colspan="6">尚无独立续采计划</td></tr>'}catch(e){by('continuationSummary').textContent='无法核实最新存档（不以0条代替）：'+e.message}finally{busy=false}}by('refreshContinuations').onclick=reload;by('continuationRows').onclick=async event=>{const node=event.target.closest('button')?.dataset.node;if(!node)return;const id=++token;try{const response=await fetch('/api/continuation?node='+encodeURIComponent(node));const data=await response.json();if(id!==token)return;if(!response.ok)throw Error(data.error||'读取失败');by('continuationDetail').textContent=JSON.stringify(data,null,2)}catch(e){if(id===token)by('continuationDetail').textContent=e.message}};reload();setInterval(reload,15000)})();</script>'''
+PAGE=PAGE.replace('</main>',CONTINUATION_PANEL+'</main>',1).replace('</body>',CONTINUATION_SCRIPT+'</body>',1)
+PAGE=PAGE.replace('跨批次累计去重帖子','跨原批次累计去重帖子')
+PAGE=PAGE.replace('运行与结果','原始批次任务（独立续采见下方）').replace('全部安全停止','原任务全部安全停止（不含独立续采）')
+
+
 def read_json(path: Path, default: object) -> object:
+    if path.name in STATE_NAMES and (path.exists() or path.with_suffix('.sqlite3').exists()):
+        return read_state(path, live=True).state
     try: return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError): return default
 
@@ -485,7 +502,8 @@ class JobManager:
         raw=read_json(directory/"raw.json",{});config=read_json(directory/"run_config.json",{});return isinstance(raw,dict) and bool(raw) and not bool(raw.get("finalized",False)) and not (isinstance(config,dict) and bool(config.get("data_quality_warning")))
     def _latest_incomplete(self)->Path|None:
         if not OUTPUT_ROOT.exists(): return None
-        return next((p for p in sorted(OUTPUT_ROOT.iterdir(),reverse=True) if p.is_dir() and self._incomplete(p) and normalize_node(read_json(p/"run_config.json",{}).get("account_node","a"))==self.node_id),None)
+        # Filter cheap account metadata before parsing a potentially huge raw.
+        return next((p for p in sorted(OUTPUT_ROOT.iterdir(),reverse=True) if p.is_dir() and normalize_node(read_json(p/"run_config.json",{}).get("account_node","a"))==self.node_id and self._incomplete(p)),None)
     def snapshot(self,include_logs:bool=True)->dict[str,Any]:
         """Return UI state without reparsing a potentially huge raw.json file.
 
@@ -511,6 +529,9 @@ class JobManager:
     def _launch(self,directory:Path,config:dict[str,Any],resume:bool=False,profile_location_backfill_only:bool=False)->None:
         if read_json(directory/"raw.json",{}).get("guard_hold"):
             raise RuntimeError("数据质量保护暂停：先核验日期查询和响应，再人工解除保护；不能直接恢复空跑。")
+        if self.node_id in 'abcde' and (CONTINUATION_ROOT/self.node_id/'continuation_plan.json').exists():
+            if worker_observations(CONTINUATION_ROOT)[self.node_id]['worker_alive']:
+                raise RuntimeError('该账号正在独立游标续采；不能启动第二个采集任务')
         self.operation="profile_location" if profile_location_backfill_only else "collect"
         self.status="running"; self.label="正在快速补自填位置" if profile_location_backfill_only else ("正在继续采集" if resume else "正在采集"); self.output_dir=directory; self.result_url=""; self.can_resume=False
         if not resume:self.logs=[]
@@ -713,9 +734,36 @@ class Handler(BaseHTTPRequestHandler):
         if length>1_000_000:raise ValueError("请求过大")
         return json.loads(self.rfile.read(length).decode()) if length else {}
     def do_GET(self)->None:
+        try:
+            self._do_GET()
+        except (BrokenPipeError,ConnectionAbortedError,ConnectionResetError):
+            return
+        except (ValueError,RuntimeError,OSError,sqlite3.Error,subprocess.SubprocessError) as exc:
+            self.send_json({'error':'最新存档核验失败：'+type(exc).__name__},HTTPStatus.SERVICE_UNAVAILABLE)
+
+    def _do_GET(self)->None:
         parsed=urllib.parse.urlsplit(self.path)
         if parsed.path=="/":self.send_bytes(PAGE.encode(),"text/html; charset=utf-8");return
         if parsed.path=="/api/accounts":self.send_json({"accounts":accounts_payload()});return
+        if parsed.path=='/api/continuations':
+            self.send_json({'accounts':audit_continuations(CONTINUATION_ROOT,live=True)});return
+        if parsed.path=='/api/continuation':
+            params=urllib.parse.parse_qs(parsed.query);node=params.get('node',[''])[0]
+            view=continuation_view(CONTINUATION_ROOT,node,preview_limit=200,live=True)
+            view.update(worker_observations(CONTINUATION_ROOT)[node]);self.send_json(view);return
+        if parsed.path=='/api/continuation/export':
+            from x_export_column_txt import export_checkpoint
+            params=urllib.parse.parse_qs(parsed.query);node=params.get('node',[''])[0]
+            _,source=plan_paths(CONTINUATION_ROOT,node)
+            destination=ROOT/'outputs/current_checkpoint_exports'/f'{node}_{time.time_ns()}.txt'
+            receipt=export_checkpoint(source,destination,node.upper())
+            self.send_response(200);self.send_header('Content-Type','text/plain; charset=utf-8')
+            self.send_header('Content-Disposition',f'attachment; filename="{node}_continuation.txt"')
+            self.send_header('Content-Length',str(destination.stat().st_size));self.send_header('Cache-Control','no-store')
+            self.send_header('X-Checkpoint-Revision',receipt['revision']);self.end_headers()
+            import shutil
+            with destination.open('rb') as stream:shutil.copyfileobj(stream,self.wfile,1024*1024)
+            return
         if parsed.path=="/api/status":
             params=urllib.parse.parse_qs(parsed.query);node=normalize_node(params.get("node",[self.headers.get("X-Account-Node","a")])[0],True);snapshot=MANAGERS[node].snapshot();snapshot["nodes"]={key:manager.snapshot(include_logs=False) for key,manager in MANAGERS.items() if ACCOUNT_NODES[key].get("active",True)};self.send_json(snapshot);return
         if parsed.path=="/api/history":

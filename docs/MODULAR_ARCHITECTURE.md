@@ -17,6 +17,9 @@ tools/
     browser.py                    Chrome 响应缓存、滚动触发、精确 cursor 请求
     http_transport.py             隔离 HTTP 实验传输接口，不是默认生产后端
     storage.py                    JSON 原子替换、可选 SQLite 增量事务
+    state.py                      界面/审计/统计/导出的统一权威快照读取
+    continuation_view.py          独立续采视图、快照版本及真实进程观察
+    resume.py                     只允许核实过的人工暂停恢复，不清其他保护
     evidence.py                   仅供实时状态使用的有界证据缓存
     metrics.py                    分阶段计时，不记录凭证/请求正文
     progress.py                   追加式检查点增量前沿，重试换列表时重扫
@@ -58,9 +61,21 @@ SQLite 使用 WAL 和 synchronous=FULL；首次导入独立续采自己的 JSON�
 
 恢复优先读 SQLite：即使最后兼容 JSON 较旧，也恢复事务里更晚的帖子与 cursor。JSON 的哈希锚点被改动、数据库缺行、计划不符、新 guard_hold 都阻止盲目恢复。已有 SQLite 时用默认 JSON 启动会明确拒绝，避免退回旧快照。持久化冷却尚未到期时，恢复实例在启动浏览器前继续等待，不能通过重启缩短 reset/退避。
 
-启用此后端后，**旧的直接读取 JSON 的脚本尚不具备 SQLite 实时读取能力**。实时查看请用 `x_read_checkpoint.py <continuation_raw.json>`，或 `x_workbench.storage.load_continuation_state`。不要用旧快照统计最新落盘量；不要单独复制正在运行的数据库文件而丢掉 WAL，备份应在安全停止后整体保存或使用 SQLite backup。旧五批原始数据从未自动转换。
+当前界面、独立续采审计、快照脚本、通用TXT导出及读取助手已通过`x_workbench.state.read_state`读取权威状态；未迁移的历史实验/维护脚本仍不能直接用旧JSON统计SQLite模式实时数据，尤其不能照搬旧暂停/恢复脚本。实时查看也可用`x_read_checkpoint.py <continuation_raw.json>`。不要单独复制正在运行的数据库文件而丢掉WAL，备份应在安全停止后整体保存或使用SQLite backup。旧五批原始数据不自动转换，独立续采仅在本次明确授权恢复时显式选用SQLite。
 
 本模式仍须在真实任务前做验收，故不默认打开。断电模拟只验证事务/恢复逻辑，不能替代硬盘与操作系统的真实断电测试。极端地在 JSON 替换和锚点更新之间崩溃，会安全拒绝并要求核验，不悄悄选择较旧数据。
+
+## 第三阶段：统一读取与显式恢复
+
+- `read_state`每次捕获一个已提交版本；JSON版本为内容SHA256，SQLite版本为事务generation。SQLite元数据与帖子在同一读取事务中取得，不混用另一个时刻的status计数。预览只读取最后若干条，计数仍是完整数据库计数；审计/导出/恢复完整核验快照锚点。实时界面可对未变化的兼容文件哈希作有界元数据缓存，但不以此替代最终验收。
+- SQLite损坏、快照被手工改动或没有已提交状态时明确报错，**不得悄悄退回旧JSON，更不能显示为0条**。
+- 界面新增“独立游标续采·最新存档”，显示本轮实际新增、当前日期/页码、已核验续采末端、待处理日期、实际进程、后端与快照版本。原始批次和独立新增不混称总量。旧工作台管理器的开始/暂停按钮不控制独立worker，面板明确标为只读；原任务启动器发现同账号独立worker时拒绝再启动。
+- `/api/continuations`、`/api/continuation?node=a`、`/api/continuation/export?node=a`统一读取；TXT下载与receipt记录同一个捕获版本，运行中后一次请求可能读到新版本，这是正常进展，不是统计矛盾。
+- 原历史界面的帖子数改为原始存档实际计数；跨原批次去重不再以旧research_dataset导出冒充最新数据。启动时先按账号配置筛选再解析大文件，减少跨账号重复读取。
+- `x_guard_audit`增加独立续采子报告；`x_audit_continuations.py`只读核对五批存档和真实进程。原批次完成与独立续采末端验证严格分开，旧页链缺证不反向补证。
+- `x_resume_verified_five.py --pause-dir ...`默认仅预检。只有明确`--launch`才备份并恢复；验证当前文件与安全暂停备份SHA一致、帖子ID唯一且全保留、计划/原配置/全部历史源无漂移、账号无worker或专属Chrome、锁与旧PID一致、没有新保护。只结算与暂停报告完全吻合的已知人工关闭driver标记，未知/登录/HTTP保护一律保留。恢复前再检查文件未变化；原账号、run_id、cursor、查询条件与退避不改。不恢复自动心跳。
+
+新增验收：有意让JSON落后一页，界面、审计和TXT仍同为数据库最新条数与相同revision；修改兼容JSON保护后返回503而非旧计数；人工暂停恢复拒绝未知保护、变更文件、重复/缺失ID及未核实停止。真实长链运行与无浏览器签名测速仍不能由这些离线测试替代。
 
 ## 重复核验优化
 

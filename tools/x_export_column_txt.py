@@ -2,6 +2,8 @@
 import csv
 import hashlib
 import json
+import os
+import tempfile
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,15 +30,41 @@ def export_rows(posts,batch,destination):
             # Quotes are ordinary text in TSV: write escaped columns directly.
             f.write('\t'.join(escape(v) for v in vals)+'\n')
 
+
+def export_checkpoint(source, destination, batch, *, snapshot=None):
+    """Export exactly one authoritative revision, never a stale JSON snapshot."""
+    from x_workbench.state import read_state
+    from x_workbench.storage import write_json_atomic
+    snapshot = snapshot if snapshot is not None else read_state(source)
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=destination.name+'.',suffix='.tmp',dir=destination.parent)
+    os.close(descriptor)
+    temporary = Path(name)
+    try:
+        export_rows(snapshot.state['posts'],batch,temporary)
+        with temporary.open('r+b') as stream:
+            os.fsync(stream.fileno())
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    receipt = {**snapshot.receipt(), 'rows':snapshot.post_count,'columns':len(HEADER),
+               'export_sha256':hashlib.sha256(destination.read_bytes()).hexdigest(),
+               'scope':'this_checkpoint_only_not_merged_historical_total'}
+    write_json_atomic(destination.with_suffix('.receipt.json'),receipt)
+    return receipt
+
 def main():
     OUT.mkdir(parents=True,exist_ok=True)
     manifest=[]; plan=[]
     for batch,run_id in RUNS.items():
         folder=ROOT/'outputs/x_keyword_runs'/run_id
         source=folder/'raw.json'; data=source.read_bytes(); before=hashlib.sha256(data).hexdigest()
-        raw=json.loads(data.decode('utf-8-sig')); config=json.loads((folder/'run_config.json').read_text(encoding='utf-8-sig'))
+        from x_workbench.state import read_state
+        snapshot=read_state(source);raw=snapshot.state
+        config=json.loads((folder/'run_config.json').read_text(encoding='utf-8-sig'))
         keyword=raw['requested_keywords'][0]; dest=OUT/f'{batch}_{keyword}_posts.txt'
-        export_rows(raw['posts'],batch,dest)
+        export_receipt=export_checkpoint(source,dest,batch,snapshot=snapshot)
         with dest.open(encoding='utf-8-sig') as f:
             assert next(f).rstrip('\n').split('\t')==HEADER
             count=0
@@ -51,7 +79,7 @@ def main():
             reason=r.get('stop_reason','')
             if reason in TECHNICAL or (reason=='no_new_results' and not r.get('count')):
                 plan.append({'batch':batch,'run_id':run_id,'account_node':config.get('account_node'), 'keyword':keyword,'date_start':start,'date_end':end,'latest_reason':reason,'pages':r.get('json_pages_used'),'attempt_posts':r.get('count'),'error':r.get('interruption_error') or r.get('error',''),'status':'pending_live_pagination_validation_and_sufficiency_definition'})
-        manifest.append({'batch':batch,'keyword':keyword,'file':dest.name,'rows':count,'columns':len(HEADER),'bytes':dest.stat().st_size,'source_sha256':before,'export_sha256':hashlib.sha256(dest.read_bytes()).hexdigest(),'raw_unchanged':True})
+        manifest.append({'batch':batch,'keyword':keyword,'file':dest.name,'rows':count,'columns':len(HEADER),'bytes':dest.stat().st_size,'source_sha256':before,'source_snapshot':snapshot.receipt(),'export_sha256':export_receipt['export_sha256'],'raw_unchanged':True})
         print(json.dumps(manifest[-1],ensure_ascii=False),flush=True)
     (OUT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
     (OUT/'exception_repair_plan.json').write_text(json.dumps({'collector_started':False,'original_configs_unchanged':True,'needs_sufficiency_definition':True,'repair_policy':'coverage_first','outside_original_config':'A/B/C September 29-30 and D/E September 30 are not added to collection automatically','queue':plan},ensure_ascii=False,indent=2),encoding='utf-8')

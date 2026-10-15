@@ -42,6 +42,9 @@ def coverage(config, keywords, runs):
 
 
 def read_json(path):
+    from x_workbench.state import STATE_NAMES, read_state
+    if path.name in STATE_NAMES:
+        return read_state(path).state
     # Atomic collector writes allow a consistent individual file; report disagreement, never overwrite.
     return json.loads(path.read_text(encoding='utf-8-sig'))
 
@@ -162,6 +165,12 @@ def main():
         except Exception as exc:
             reports[node] = dict(run_id=run, issues=['audit_read_failed'], error=type(exc).__name__, complete=False)
         print(json.dumps({k: v for k, v in reports[node].items() if k not in ('dates', 'mandatory_dates', 'fingerprint')}, ensure_ascii=False))
+    from x_workbench.continuation_view import audit_continuations
+    try:
+        reports['_continuations']={'accounts':audit_continuations(args.root/'outputs/cursor_continuation_20261012'),
+                                   'scope':'independent_exact_cursor_plans_not_original_batch_completion'}
+    except Exception as exc:
+        reports['_continuations']={'issues':['authoritative_checkpoint_read_failed'],'error':type(exc).__name__,'complete':False}
     tmp = report_path.with_suffix('.tmp')
     tmp.write_text(json.dumps(reports, ensure_ascii=False, indent=2), encoding='utf-8')
     tmp.replace(report_path)
