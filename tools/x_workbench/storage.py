@@ -21,7 +21,7 @@ def database_write(connection):
         raise OSError("Checkpoint database transaction failed") from exc
 
 
-def write_json_atomic(path, value):
+def write_json_atomic(path, value, *, return_digest=False):
     """Unique temp + flush/fsync + atomic replacement; never truncate target."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -30,9 +30,11 @@ def write_json_atomic(path, value):
         descriptor, temporary_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
         temporary = Path(temporary_name)
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
-                # Retain the compatibility format and fast in-memory serializer.
-                stream.write(json.dumps(value, ensure_ascii=False, indent=2))
+            # Own the descriptor before serializing so failures close it on Windows.
+            with os.fdopen(descriptor, "wb") as stream:
+                with measure("json_serialize"):
+                    serialized = json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
+                stream.write(serialized)
                 stream.flush()
                 os.fsync(stream.fileno())
             for attempt in range(8):
@@ -43,6 +45,7 @@ def write_json_atomic(path, value):
                     if attempt >= 7:
                         raise
                     time.sleep(0.12 * (attempt + 1))
+            return hashlib.sha256(serialized).hexdigest() if return_digest else None
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -108,9 +111,10 @@ class SQLiteCheckpoint:
             raise ValueError("Append-only checkpoint cannot remove posts")
         metadata = {key: value for key, value in payload.items() if key != "posts"}
         # Serialize before BEGIN: any serialization failure cannot advance cursor.
-        additions = [(index, json.dumps(posts[index], ensure_ascii=False, separators=(",", ":")))
-                     for index in range(self.count, len(posts))]
-        state = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+        with measure("json_serialize"):
+            additions = [(index, json.dumps(posts[index], ensure_ascii=False, separators=(",", ":")))
+                         for index in range(self.count, len(posts))]
+            state = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
         generation = self.generation + 1
         anchor = hashlib.sha256(self.snapshot_path.read_bytes()).hexdigest() if not self.generation and self.snapshot_path.exists() else None
         with measure("checkpoint_write"), database_write(self.connection):

@@ -9,7 +9,7 @@
     {
       "path": "tools/x_keyword_collector.py",
       "source": "project/tools/x_keyword_collector.py",
-      "sha256": "9469f6e1cd5807b10b34151c8fd4714d6d47f5b9b241022c26a6ab438e7870bb"
+      "sha256": "fc69d7766ee03730ce4e5f8ab7894ec81d04adf9275fa8a839b3daa943d8cc5d"
     },
     {
       "path": "tools/x_keyword_ui.py",
@@ -34,7 +34,7 @@
     {
       "path": "tools/x_continue_saved_cursors.py",
       "source": "project/tools/x_continue_saved_cursors.py",
-      "sha256": "f4b74841007024e28423fbae9038e49580a897c28b1cf6ef990809446e2a4f0a"
+      "sha256": "d9b504115e7ab5f4a010f1239c2309c3bb35cdccbf9d3b6d679aca653cab83f7"
     },
     {
       "path": "tools/x_recovery_policy.py",
@@ -129,17 +129,17 @@
     {
       "path": "tests/test_x_workbench_components.py",
       "source": "project/tests/test_x_workbench_components.py",
-      "sha256": "9cad980c4cc8b4e79abaae4435c82618f91c6384e132ab420deb08404889d405"
+      "sha256": "08ba4985d49018b8eb5c65f29cbc03922739ba8a942dfc79736e8a079c793425"
     },
     {
       "path": "docs/MODULAR_ARCHITECTURE.md",
       "source": "project/docs/MODULAR_ARCHITECTURE.md",
-      "sha256": "46d8c44e584967739307b905161c8737275925ee50ac984d84157da1963e6d3a"
+      "sha256": "010bdad47729fa107ff9c36be90b2c6ad80e6e8807889e87a527d4811eab6ac0"
     },
     {
       "path": "tools/x_workbench/__init__.py",
       "source": "project/tools/x_workbench/__init__.py",
-      "sha256": "b7c829d9c47012fff365f11e4e3c0891c34f5ffbaf2719c2d38e784c7c044351"
+      "sha256": "c541b6bae0dc46a779cd56f63fc4d2c91f1b9fdea797eaffbdb70e93ec0f4aab"
     },
     {
       "path": "tools/x_workbench/browser.py",
@@ -164,7 +164,7 @@
     {
       "path": "tools/x_workbench/metrics.py",
       "source": "project/tools/x_workbench/metrics.py",
-      "sha256": "d5a6aa895c39523d885959b3680c8aa9c8c514b384074aa40b6c721a0dc60936"
+      "sha256": "39c56671dfa6f52fb2202eeead2e29dd437a1851ce42e49d57f3c2390e631797"
     },
     {
       "path": "tools/x_workbench/parsing.py",
@@ -189,8 +189,18 @@
     {
       "path": "tools/x_workbench/storage.py",
       "source": "project/tools/x_workbench/storage.py",
-      "sha256": "f4eda8abbf12a168e3105c273f88377e99514aa690534761c47d7a26397933bf"
+      "sha256": "69ca4de2779615358f4a42af8716efbf9daa71de7d6883f995c9fce8cb249b7c"
+    },
+    {
+      "path": "tools/x_workbench/progress.py",
+      "source": "project/tools/x_workbench/progress.py",
+      "sha256": "f50355bedd1da144f336e649e736cec1cb31feb9b47e582954ca231ddb5012d5"
+    },
+    {
+      "path": "tests/test_x_efficiency_regressions.py",
+      "source": "project/tests/test_x_efficiency_regressions.py",
+      "sha256": "c426fb0efbe4cb4201d0e31b89760eda69df836d4696cac619343bb94eea25bd"
     }
   ],
-  "revision_notes": "Modularization phase 1; optional SQLite checkpoints; status-only evidence cache; stage timings; HTTP experimental boundary, no real account/speed validation or production transport switch."
+  "revision_notes": "Modularization and efficiency phase 2: append-only checkpoint deltas/day index, response archive reuse, single initial parse, queue reuse, exclusive stage timing. SQLite remains opt-in; no real-account HTTP speed validation or production transport switch."
 }

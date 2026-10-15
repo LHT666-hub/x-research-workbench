@@ -45,6 +45,7 @@ py -3 -m venv .venv
 - 独立续采增加可选`--checkpoint-backend sqlite`，帖子和cursor同事务增量提交；默认JSON不变。启用后SQLite为权威、JSON快照可能滞后，旧JSON报表不能当实时数据，先看[兼容与恢复说明](docs/MODULAR_ARCHITECTURE.md)。不是对旧五批的自动转换。
 - 直接HTTP实验接口已与同一分页/结束政策连接，**默认禁止请求，未接入正式UI/CLI，尚未完成真实签名/会话与速度验证**。不是安装后便自动无浏览器；不直接接入twscrape、不轮换账号、不绕限流。
 - `tools/x_offline_checkpoint_benchmark.py`仅用临时合成数据测试存储，不登录、不请求X，不能作为实网倍速证明。
+- 第二轮减少了逐页全列表扫描/复制、按日期反复全量筛选、同页证据重复落盘、首响应重复解析及队列重复构造；搜索前仅阶段变化时不重建CSV/HTML/ZIP。新增独占耗时`self_seconds`，避免嵌套计时造成误读。这些不降低限流等待，不放宽证据核验。
 
 ## 什么才叫搜索到底
 
@@ -61,7 +62,7 @@ py -3 -m venv .venv
 ## 测试与版本
 
 ```powershell
-.venv\Scripts\python.exe -m pytest tests/test_x_workbench_components.py tests/test_x_keyword_collector.py tests/test_x_keyword_ui.py tests/test_x_search_empty_tail.py tests/test_x_cursor_continuation.py tests/test_x_404_recovery.py tests/test_x_bounded_404_retry.py tests/test_x_recovery_policy_v2.py tests/test_x_guard_audit.py -q
+.venv\Scripts\python.exe -m pytest tests/test_x_efficiency_regressions.py tests/test_x_workbench_components.py tests/test_x_keyword_collector.py tests/test_x_keyword_ui.py tests/test_x_search_empty_tail.py tests/test_x_cursor_continuation.py tests/test_x_404_recovery.py tests/test_x_bounded_404_retry.py tests/test_x_recovery_policy_v2.py tests/test_x_guard_audit.py -q
 ```
 
 浏览器/HTTP交接实验另有可选依赖，不混入日常安装。源码来源与SHA256清单见 [SOURCE_SNAPSHOT.json](SOURCE_SNAPSHOT.json)。旧版本通过Git历史查询，不需要另建“新版/最终版/最终最终版”源码目录。

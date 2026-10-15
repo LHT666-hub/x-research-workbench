@@ -411,18 +411,24 @@ def test_continuation_runner_checkpoint_integration_without_browser(tmp_path, mo
         def __exit__(self, *args): return False
     monkeypatch.setattr(c, "sync_playwright", Playwright)
     def collect(*args, **kwargs):
-        progress = {**item, "json_pages_used": 101, "last_cursor": "saved-101", "count": 2,
-                    "parsed_post_count": 1, "date_rejected_count": 0, "stop_reason": "in_progress"}
-        kwargs["checkpoint"]([old_post, {**old_post, "post_id": "2"}], progress)
-        saved = storage.load_continuation_state(tmp_path / "collection/continuation_raw.json")
-        assert saved["current_progress"]["page"] == 101 and len(saved["posts"]) == 1
+        rows = [old_post, {**old_post, "post_id": "2"}]
+        for page in (101, 102, 103):
+            if page == 102:
+                rows.append({**old_post, "post_id": "3"})
+            progress = {**item, "json_pages_used": page, "last_cursor": f"saved-{page}", "count": len(rows),
+                        "parsed_post_count": len(rows) - 1, "date_rejected_count": 0, "stop_reason": "in_progress"}
+            kwargs["checkpoint"](rows, progress)
+            saved = storage.load_continuation_state(tmp_path / "collection/continuation_raw.json")
+            assert saved["current_progress"]["page"] == page
+            assert len(saved["posts"]) == (1 if page == 101 else 2)
+        assert saved["search_runs"][0]["last_cursor"] == "saved-103"  # Empty new tail still durable.
         return [], {**progress, "stop_reason": "max_pages", "coverage_status": "truncated", "state_code": "max_pages"}
     monkeypatch.setattr(c, "collect_search_graphql", collect)
     monkeypatch.setattr(sys, "argv", ["runner", "--account-node", "a", "--run-id", "synthetic", "--plan", str(plan_path),
         "--search-engine", "graphql", "--author-strategy", "deferred", "--checkpoint-backend", backend])
     runner.main()
     result = json.loads((tmp_path / "collection/continuation_raw.json").read_text(encoding="utf-8"))
-    assert len(result["posts"]) == 1 and result["posts"][0]["post_id"] == "2"
+    assert [post["post_id"] for post in result["posts"]] == ["2", "3"]
     assert not result["finalized"] and not result["guard_hold"]
     assert not (tmp_path / "collection/worker.lock").exists()
     assert hashlib.sha256(source_path.read_bytes()).hexdigest() == source_sha

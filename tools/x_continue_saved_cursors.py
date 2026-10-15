@@ -13,6 +13,7 @@ import x_keyword_collector as c
 from x_workbench.storage import SQLiteCheckpoint
 from x_workbench.metrics import StageTimings, timing_scope, current_timings, measure, measured_sleep
 from x_workbench.evidence import EvidenceCache, evidence_cache_scope
+from x_workbench.progress import RowDeltaTracker
 from x_plan_cursor_continuation import read,local_day,manual_pause_verified
 from x_recovery_policy import POLICY_ID,may_verify_404,backoff_seconds,policy_receipt,protected_error,enabled_by_settings
 
@@ -169,6 +170,9 @@ def _main():
         if store:store.close()
         lock.unlink(); raise RuntimeError('独立计划改变或存在新保护；禁止恢复')
     known.update(str(r.get('post_id') or r.get('post_url')) for r in payload['posts'])
+    new_posts_by_day={}
+    for post in payload['posts']:
+        new_posts_by_day.setdefault(local_day(post),[]).append(post)
     payload['recovery_policy']={**policy_receipt(node,args.verify_404_once),'activated_at':c.now_iso(),'worker_pid':os.getpid()}
     status_cache=EvidenceCache()
     def save(force_snapshot=False):
@@ -228,7 +232,7 @@ def _main():
                     if processed and processed%cfg['break_every']==0:
                         measured_sleep(random.uniform(cfg['break_min'],cfg['break_max']))
                     day=item['slice_start']; seed=list(baseline[day].values())
-                    seed.extend(p for p in payload['posts'] if local_day(p)==day)
+                    seed.extend(new_posts_by_day.get(day,[]))
                     record=next((r for r in reversed(payload['search_runs']) if r.get('source_record_index')==item['source_record_index'] and r.get('source_path')==item['source_path']),None)
                     if record is None:
                         record={**item,'started_at':c.now_iso(),'stop_reason':'in_progress','new_saved_posts':0,
@@ -237,16 +241,20 @@ def _main():
                         payload['search_runs'].append(record)
                     payload.update(current_date=day,active_phase='searching',current_progress={'source_page':item['json_pages_used'],'page':record['json_pages_used'],'new_saved_posts':record['new_saved_posts']}); save()
                     print(f"[精确续采] {node.upper()} {item['keyword']} {day} 原尝试{item['source_attempt_count']}条/页{item['json_pages_used']}，基线合并{len(seed)}条；不从首页采集。",flush=True)
+                    row_delta=RowDeltaTracker()
                     def checkpoint(rows,progress):
-                        for post in rows:
-                            key=str(post.get('post_id') or post.get('post_url') or '')
-                            if key and key not in known:
-                                known.add(key); payload['posts'].append(post); record['new_saved_posts']+=1
+                        with measure('checkpoint_merge'):
+                            for post in row_delta.pending(rows):
+                                key=str(post.get('post_id') or post.get('post_url') or '')
+                                if key and key not in known:
+                                    known.add(key); payload['posts'].append(post); record['new_saved_posts']+=1
+                                    new_posts_by_day.setdefault(local_day(post),[]).append(post)
                         record.update(progress); record['checkpoint_at']=c.now_iso()
                         payload['current_progress']={'source_page':item['json_pages_used'],'page':progress['json_pages_used'],
                             'new_saved_posts':record['new_saved_posts'],'baseline_union_with_continuation':progress['count'],
                             'parsed_this_continuation':progress['parsed_post_count'],'date_rejected_this_continuation':progress['date_rejected_count']}
-                        save(); print(f"[实际落盘] {day} 页{progress['json_pages_used']}，新增{record['new_saved_posts']}，累计独立新增{len(payload['posts'])}。",flush=True)
+                        save(); row_delta.acknowledge(rows)
+                        print(f"[实际落盘] {day} 页{progress['json_pages_used']}，新增{record['new_saved_posts']}，累计独立新增{len(payload['posts'])}。",flush=True)
                     for attempt in range(cfg['retry_limit']+1):
                         try:
                             _,coverage=c.collect_search_graphql(page,item['keyword'],1,0,cfg['max_scrolls'],out,
@@ -280,7 +288,7 @@ def _main():
                                     event['verification_error']=str(verification_error);save();raise
                                 event.update(verified=True,proof_file=proof_file,resolved_at=c.now_iso())
                                 # Preserve the actual newly verified next page before proceeding.
-                                durable_seed=list(baseline[day].values())+[p for p in payload['posts'] if local_day(p)==day]
+                                durable_seed=list(baseline[day].values())+list(new_posts_by_day.get(day,[]))
                                 merged={str(p.get('post_id') or p.get('post_url')):p for p in durable_seed+verified_rows}
                                 checkpoint(list(merged.values()),{'query':record['query'],'slice_start':day,'slice_end':day,
                                     'count':len(merged),'json_pages_used':record['json_pages_used']+1,
@@ -306,7 +314,7 @@ def _main():
                             if attempt>=cfg['retry_limit']:
                                 record.update(stop_reason='interrupted_with_saved_sample',interruption_error=str(exc),completed_at=c.now_iso())
                                 save(); break
-                            seed=list(baseline[day].values())+[p for p in payload['posts'] if local_day(p)==day]
+                            seed=list(baseline[day].values())+list(new_posts_by_day.get(day,[]))
                             payload.update(active_phase='searching',cooldown_until_epoch=None)
                     processed+=1
                     # New instances can stop cooperatively at a persisted date

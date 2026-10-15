@@ -68,6 +68,7 @@ from x_workbench.browser import (
 )
 from x_workbench.policy import RETRYABLE_SEARCH_STOP_REASONS, EMPTY_TAIL_REQUIRED_RESPONSES, EMPTY_TAIL_POLICY
 from x_workbench.storage import write_json_atomic as _write_json_atomic
+from x_workbench.progress import RowDeltaTracker
 from x_workbench.evidence import EvidenceCache, evidence_cache_scope
 from x_workbench.metrics import (
     StageTimings,
@@ -76,6 +77,7 @@ from x_workbench.metrics import (
     measure,
     measured_sleep,
 )
+from x_workbench.metrics import timed
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -484,12 +486,14 @@ def _status_payload(payload: dict[str, object]) -> dict[str, object]:
         return _build_status_payload(payload)
 
 
-def _build_status_payload(payload: dict[str, object]) -> dict[str, object]:
+def _build_status_payload(payload: dict[str, object], *, repair_queue=None, profile_queue=None) -> dict[str, object]:
     coverage = list(payload.get("search_runs", []))
     completed = reliable_search_keys(coverage)
-    repair_queue = search_repair_queue(coverage, str(payload.get("repair_policy", "strict")))
+    if repair_queue is None:
+        repair_queue = search_repair_queue(coverage, str(payload.get("repair_policy", "strict")))
     authors = payload.get("authors", {}) if isinstance(payload.get("authors"), dict) else {}
-    profile_queue = profile_location_queue(authors)
+    if profile_queue is None:
+        profile_queue = profile_location_queue(authors)
     return {
         "keyword_count": len(payload.get("requested_keywords", [])),
         "completed_keywords": len(completed),
@@ -518,11 +522,16 @@ def save_checkpoint(output_dir: Path, payload: dict[str, object]) -> None:
     """Persist resumable state without rebuilding every research export."""
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_json_atomic(output_dir / "raw.json", payload)
-    _write_json_atomic(output_dir / "status.json", _status_payload(payload))
-    _write_json_atomic(output_dir / "repair_queue.json", search_repair_queue(payload.get("search_runs", []), str(payload.get("repair_policy", "strict"))))
-    _write_json_atomic(output_dir / "profile_location_queue.json", profile_location_queue(payload.get("authors", {})))
+    with evidence_cache_scope(_STATUS_EVIDENCE_CACHE), measure("status_build"):
+        repairs = search_repair_queue(payload.get("search_runs", []), str(payload.get("repair_policy", "strict")))
+        profiles = profile_location_queue(payload.get("authors", {}))
+        status = _build_status_payload(payload, repair_queue=repairs, profile_queue=profiles)
+    _write_json_atomic(output_dir / "status.json", status)
+    _write_json_atomic(output_dir / "repair_queue.json", repairs)
+    _write_json_atomic(output_dir / "profile_location_queue.json", profiles)
 
 
+@timed("export")
 def save_outputs(output_dir: Path, payload: dict[str, object]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     posts = list(payload.get("posts", []))
@@ -841,29 +850,34 @@ def _collect_search_graphql_impl(page, keyword: str, keyword_index: int, limit: 
     response_manifest = []
     for page_index in range(max_pages-offset):
         pages_used = offset + page_index + 1
-        parsed, cursor = parse_search_timeline(payload, keyword, keyword_index)
+        if page_index == 0 and resume_record is None:
+            parsed, cursor = first_rows, first_cursor
+        else:
+            parsed, cursor = parse_search_timeline(payload, keyword, keyword_index)
         response_identity = id(getattr(response, 'original', response))
         association_valid = _search_response_matches(response, query, response_expected_cursor)
+        page_archive = None
         if resume_record is not None:
             if not association_valid:
                 raise RuntimeError('续采响应查询/游标不匹配；禁止推进检查点')
             evidence_dir.mkdir(parents=True,exist_ok=True)
             archive=evidence_dir/f'continuation_page_{pages_used:04d}.json'
-            _write_json_atomic(archive,payload)
-            response_manifest.append({'page':pages_used,'query':query,'http_status':response.status,
+            archive_digest = _write_json_atomic(archive,payload,return_digest=True)
+            page_archive = {'page':pages_used,'query':query,'http_status':response.status,
                 'request_cursor':response_expected_cursor,'next_cursor':cursor or '',
                 'parsed_post_ids':[r.get('post_id') for r in parsed],
-                'response_file':str(archive.resolve()),'sha256':hashlib.sha256(archive.read_bytes()).hexdigest()})
+                'response_file':str(archive.resolve()),'sha256':archive_digest}
+            response_manifest.append(page_archive)
             _write_json_atomic(evidence_dir/'responses_manifest.json',response_manifest)
         if rows and not parsed and cursor and _cursor_only_empty_payload(payload) and response.status == 200 and association_valid and response_identity not in consumed_response_ids:
             evidence_dir.mkdir(parents=True, exist_ok=True)
-            response_file = evidence_dir / f'page_{pages_used:04d}.json'
-            _write_json_atomic(response_file, payload)
+            response_file = Path(page_archive['response_file']) if page_archive else evidence_dir / f'page_{pages_used:04d}.json'
+            response_digest = page_archive['sha256'] if page_archive else _write_json_atomic(response_file, payload, return_digest=True)
             empty_tail_responses.append({'page':pages_used, 'http_status':200, 'query':query,
                 'request_cursor':_search_request_cursor(response.url,response.request.post_data),
                 'request_cursor_matches':True, 'next_cursor':cursor, 'parsed_count':0,
                 'received_at':now_iso(), 'response_file':str(response_file.resolve()),
-                'sha256':hashlib.sha256(response_file.read_bytes()).hexdigest()})
+                'sha256':response_digest})
         else:
             empty_tail_responses = []
         consumed_response_ids.add(response_identity)
@@ -1009,14 +1023,14 @@ def _collect_search_graphql_impl(page, keyword: str, keyword_index: int, limit: 
                         continuation_response_manifest=str((evidence_dir/'responses_manifest.json').resolve()))
     if stop_reason=='cursor_exhausted':
         evidence_dir.mkdir(parents=True,exist_ok=True)
-        response_file=evidence_dir/'final_response.json'
-        _write_json_atomic(response_file,payload)
+        response_file=Path(page_archive['response_file']) if page_archive else evidence_dir/'final_response.json'
+        response_digest=page_archive['sha256'] if page_archive else _write_json_atomic(response_file,payload,return_digest=True)
         coverage['search_end_evidence']={'policy':'response_end_v1','responses':[{
             'http_status':response.status,'query':query,
             'request_cursor':_search_request_cursor(response.url,response.request.post_data),
             'request_cursor_matches':association_valid,'next_cursor':cursor or '',
             'parsed_count':len(parsed),'received_at':now_iso(),
-            'response_file':str(response_file.resolve()),'sha256':hashlib.sha256(response_file.read_bytes()).hexdigest()}]}
+            'response_file':str(response_file.resolve()),'sha256':response_digest}]}
     derived=classify_search_run(coverage)
     coverage.update(derived)
     coverage['search_end_status']=derived['state_code']
@@ -1657,6 +1671,16 @@ def collect_profile_locations(args: argparse.Namespace, output_dir: Path) -> Non
 
 
 def collect(args: argparse.Namespace, keywords: list[str], output_dir: Path) -> None:
+    timings = current_timings() or StageTimings()
+    with timing_scope(timings):
+        try:
+            with measure("run_total"):
+                return _collect_browser_run(args, keywords, output_dir)
+        finally:
+            _write_json_atomic(output_dir / "timings.json", timings.snapshot())
+
+
+def _collect_browser_run(args: argparse.Namespace, keywords: list[str], output_dir: Path) -> None:
     start_date = parse_date(args.start_date)
     end_date = parse_date(args.end_date)
     raw_path = output_dir / "raw.json"
@@ -1733,7 +1757,9 @@ def collect(args: argparse.Namespace, keywords: list[str], output_dir: Path) -> 
             period = f" {task_key[1]}—{task_key[2]}" if task_key[1] or task_key[2] else ""
             print(f"\n[搜索片 {task_index}/{len(work_items)}] {keyword}{period}", flush=True)
             payload["active_phase"] = "searching"
-            save_outputs(output_dir, payload)
+            # Only phase changed: keep the durable checkpoint/current status,
+            # do not rebuild identical CSV/HTML/ZIP before the next search.
+            save_checkpoint(output_dir, payload)
             search_started_at = now_iso()
             search_started_monotonic = time.monotonic()
             last_error: Exception | None = None
@@ -1741,23 +1767,28 @@ def collect(args: argparse.Namespace, keywords: list[str], output_dir: Path) -> 
             progress_rows: list[dict[str, object]] = []
             persisted_keys = {(str(p.get("keyword", "")), str(p.get("post_id", ""))) for p in posts}
             provisional_run: dict[str, object] = {}
+            row_delta = RowDeltaTracker()
 
             def persist_page(rows, progress):
                 nonlocal progress_rows, page_progress
-                progress_rows = list(rows)
+                # The pipeline owns an append-only list; retain it, do not copy
+                # and rescan every historical page on each new checkpoint.
+                progress_rows = rows
                 page_progress = dict(progress)
-                for row in rows:
+                delta = row_delta.pending(rows)
+                for row in delta:
                     key = (keyword, str(row.get("post_id", "")))
                     if key not in persisted_keys:
                         posts.append(row)
                         persisted_keys.add(key)
-                register_pending_authors(rows, authors)
+                register_pending_authors(delta, authors)
                 if rows:
                     if not provisional_run:
                         payload["search_runs"].append(provisional_run)
                     provisional_run.update({"keyword": keyword, "keyword_index": keyword_index, "started_at": search_started_at, **progress, "checkpoint_at": now_iso()})
                 payload["inflight_search"] = {"keyword": keyword, **progress, "checkpoint_at": now_iso()}
                 save_checkpoint(output_dir, payload)
+                row_delta.acknowledge(rows)
 
             for attempt in range(args.retry_limit + 1):
                 try:
